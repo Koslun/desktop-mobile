@@ -91,6 +91,11 @@
         <button type="button" id="reset-button">Reset</button>
       </div>
 
+      <div class="keys-section">
+        <div id="key-target" tabindex="0">Key target</div>
+        <input type="text" id="keys-input" autocomplete="off" />
+      </div>
+
       <div class="info-section">
         <p>This is a basic Tauri application for WebDriverIO testing.</p>
         <div class="status" id="status">Ready for testing</div>
@@ -213,6 +218,12 @@
       } else {
         updateStatus('Tauri API not available - Running in browser mode');
       }
+
+      // __keyTargetEvents records keydowns on #key-target so a spec can assert which key arrived.
+      window.__keyTargetEvents = [];
+      document.getElementById('key-target').addEventListener('keydown', (ev) => {
+        window.__keyTargetEvents.push({ key: ev.key, code: ev.code, keyCode: ev.keyCode });
+      });
 
       // Deep link listener for E2E testing
       // On Linux, deep links arrive via CLI args (not via onOpenUrl)
