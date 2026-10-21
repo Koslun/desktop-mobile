@@ -10,7 +10,7 @@ import '@wdio/native-types';
 
 const driverProvider = process.env.DRIVER_PROVIDER as 'official' | 'crabnebula' | 'embedded' | 'external' | undefined;
 
-const CONTROL_RIGHT = '';
+const CONTROL_RIGHT = '\uE051';
 
 type KeyEvent = {
   key: string;
@@ -30,7 +30,26 @@ async function keyTargetEvents() {
 
 async function editorText(selector = '#keys-editor') {
   const text = (await browser.execute(`return document.querySelector("${selector}").textContent`)) as string;
-  return text.replace(/ /g, ' ');
+  return text.replace(/\u00a0/g, ' ');
+}
+
+const NEWLINE = String.fromCharCode(10);
+
+type ValueEvent = { type: string; value: string };
+
+async function keysInputEvents() {
+  return (await browser.execute('return window.__keysInputEvents || []')) as unknown as ValueEvent[];
+}
+
+async function fillScratch(script: string) {
+  await browser.execute(`var scratch = document.querySelector("#keys-scratch"); ${script}`);
+}
+
+async function errorOf(action: Promise<unknown>) {
+  return action.then(
+    () => undefined,
+    (error: Error) => error,
+  );
 }
 
 describe('special keys (embedded)', () => {
@@ -46,7 +65,10 @@ describe('special keys (embedded)', () => {
         'document.querySelector("#keys-input").value = "";' +
         'document.querySelector("#keys-editor").textContent = "";' +
         'document.querySelector("#keys-blocking-input").value = "";' +
-        'document.querySelector("#keys-blocking-editor").textContent = "";',
+        'document.querySelector("#keys-blocking-editor").textContent = "";' +
+        'document.querySelector("#keys-textarea").value = "";' +
+        'document.querySelector("#keys-scratch").innerHTML = "";' +
+        'window.__keysInputEvents = [];',
     );
   });
 
@@ -158,5 +180,153 @@ describe('special keys (embedded)', () => {
       'var el = document.querySelector("#keys-input"); return [el.value, el.selectionStart, el.selectionEnd];',
     );
     expect(selection).toEqual(['old', 0, 3]);
+  });
+
+  it('should keep typing after the existing text when a click focuses a field', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<input id="fresh-input" value="old"><textarea id="fresh-textarea">old</textarea>';`,
+    );
+    await browser.$('#fresh-input').click();
+    await browser.keys('x');
+    expect(await browser.$('#fresh-input').getValue()).toBe('oldx');
+    await browser.$('#fresh-textarea').click();
+    await browser.keys('x');
+    expect(await browser.$('#fresh-textarea').getValue()).toBe('oldx');
+  });
+
+  it('should not type into checkboxes or file inputs', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<input type="checkbox" id="fresh-checkbox"><input type="file" id="fresh-file">';`,
+    );
+    await browser.$('#fresh-checkbox').click();
+    await browser.keys(Key.Space);
+    expect(await browser.$('#fresh-checkbox').getValue()).toBe('on');
+    await browser.execute('document.querySelector("#fresh-file").focus();');
+    expect(await errorOf(browser.keys(Key.Space))).toBeUndefined();
+  });
+
+  it('should refuse special keys when the element cannot take focus', async () => {
+    await fillScratch(`scratch.innerHTML = '<div id="fresh-plain">plain</div>';`);
+    await browser.$('#key-target').click();
+    await browser.execute('window.__keyTargetEvents = [];');
+    const error = await errorOf(browser.$('#fresh-plain').addValue(Key.Enter));
+    expect(error?.message).toMatch(/interactable/);
+    expect(await keyTargetEvents()).toEqual([]);
+  });
+
+  it('should type into an input inside a shadow root', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<div id="fresh-host"></div>';
+      document.querySelector("#fresh-host").attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input">';`,
+    );
+    const input = browser.$('#fresh-host').shadow$('#shadow-input');
+    await input.click();
+    await browser.keys('x');
+    await input.addValue(`a${Key.Backspace}b`);
+    expect(await input.getValue()).toBe('xb');
+  });
+
+  it('should send plain text after the existing content of an unfocused contenteditable', async () => {
+    await browser.execute('document.querySelector("#keys-editor").textContent = "old";');
+    await browser.$('#keys-editor').addValue('new');
+    expect(await editorText()).toBe('oldnew');
+  });
+
+  it('should type at the caret of a field that already has focus', async () => {
+    await browser.execute(
+      'var el = document.querySelector("#keys-input"); el.value = "abcd"; el.focus(); el.setSelectionRange(2, 2);',
+    );
+    await browser.$('#keys-input').addValue('X');
+    expect(await browser.$('#keys-input').getValue()).toBe('abXcd');
+  });
+
+  it('should keep modifiers held across action calls', async () => {
+    const input = browser.$('#keys-input');
+    await input.setValue('old');
+    try {
+      await browser.action('key').down(Key.Control).perform(true);
+      await browser.action('key').down('a').up('a').perform(true);
+    } finally {
+      await browser.releaseActions();
+    }
+    const selection = await browser.execute(
+      'var el = document.querySelector("#keys-input"); return [el.value, el.selectionStart, el.selectionEnd];',
+    );
+    expect(selection).toEqual(['old', 0, 3]);
+
+    await browser.$('#key-target').click();
+    await browser.execute('window.__keyTargetEvents = [];');
+    try {
+      await browser.action('key').down(Key.Shift).perform(true);
+      await browser.action('key').down(Key.PageDown).up(Key.PageDown).perform(true);
+    } finally {
+      await browser.releaseActions();
+    }
+    expect((await keyTargetEvents()).find((event) => event.key === 'PageDown')).toMatchObject({ shiftKey: true });
+  });
+
+  it('should fire input and change only when the value changes', async () => {
+    const input = browser.$('#keys-input');
+    await input.addValue(Key.NULL);
+    await input.addValue(Key.PageDown);
+    expect(await keysInputEvents()).toEqual([]);
+    await input.addValue('a');
+    expect(await keysInputEvents()).toEqual([
+      { type: 'input', value: 'a' },
+      { type: 'change', value: 'a' },
+    ]);
+  });
+
+  it('should type line breaks and quotes from the actions API', async () => {
+    await browser.$('#keys-textarea').click();
+    await browser.keys(['a', NEWLINE, "'", 'b']);
+    expect(await browser.$('#keys-textarea').getValue()).toBe(`a${NEWLINE}'b`);
+  });
+
+  it('should release held modifiers when a key fails part-way', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<div id="fresh-dropper" tabindex="-1">drop</div>';
+      var dropper = document.querySelector("#fresh-dropper");
+      dropper.addEventListener("keydown", function (ev) {
+        if (ev.key === "Shift") {
+          dropper.removeAttribute("tabindex");
+          dropper.blur();
+        }
+      });
+      window.__keyupEvents = [];
+      document.addEventListener("keyup", function (ev) {
+        window.__keyupEvents.push({ key: ev.key, shiftKey: ev.shiftKey });
+      }, true);`,
+    );
+    const error = await errorOf(browser.$('#fresh-dropper').addValue(`${Key.Shift}${Key.Enter}`));
+    expect(error?.message).toMatch(/interactable/);
+    expect(await browser.execute('return window.__keyupEvents')).toContainEqual({ key: 'Shift', shiftKey: false });
+  });
+
+  it('should break lines on Enter in a textarea and a contenteditable only', async () => {
+    await browser.$('#keys-textarea').addValue(`a${Key.Enter}b`);
+    expect(await browser.$('#keys-textarea').getValue()).toBe(`a${NEWLINE}b`);
+
+    await browser.$('#keys-editor').addValue(`a${Key.Enter}b`);
+    const editorLines = (await browser.execute('return document.querySelector("#keys-editor").innerText')) as string;
+    expect(editorLines.split(NEWLINE).filter(Boolean)).toEqual(['a', 'b']);
+
+    await browser.$('#keys-input').addValue(`a${Key.Enter}b`);
+    expect(await browser.$('#keys-input').getValue()).toBe('ab');
+  });
+
+  it('should move between radios whose group name needs escaping', async () => {
+    await fillScratch(
+      `for (var i = 1; i <= 2; i++) {
+        var radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "it" + String.fromCharCode(39) + "s";
+        radio.id = "fresh-radio-" + i;
+        scratch.appendChild(radio);
+      }`,
+    );
+    await browser.$('#fresh-radio-1').click();
+    await browser.keys(Key.ArrowDown);
+    expect(await browser.$('#fresh-radio-2').isSelected()).toBe(true);
   });
 });

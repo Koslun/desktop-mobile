@@ -7,10 +7,8 @@ use super::executor::ModifierState;
 /// The WebDriver null key; in Element Send Keys it releases every held modifier.
 pub const NULL_KEY: &str = "\u{E000}";
 
-/// Maps a WebDriver special-key value (U+E000–U+E05D) to `(key, code, keyCode)`.
-///
-/// `key` and `code` follow the W3C normalized-key and code tables; `keyCode` is the legacy value a
-/// US keyboard reports. Every code point in the range maps, so none is ever typed as text.
+/// Maps every WebDriver special-key value (U+E000–U+E05D) to `(key, code, keyCode)` per the W3C
+/// tables and a US keyboard, so none is ever typed as text.
 pub fn map_special_key(key: &str) -> Option<(&'static str, &'static str, u32)> {
     let mut chars = key.chars();
     let (Some(ch), None) = (chars.next(), chars.next()) else {
@@ -124,7 +122,34 @@ pub fn regular_key_code_for(key: &str) -> String {
     }
 }
 
-/// JS dispatching a synthetic special-key `KeyboardEvent` plus the value/selection/radio
+/// A JS string literal for `text` that is safe to splice into a script, including inside HTML.
+pub fn js_string(text: &str) -> String {
+    let mut literal = serde_json::Value::from(text).to_string();
+    for ch in ['\u{2028}', '\u{2029}', '<'] {
+        literal = literal.replace(ch, &format!("\\u{:04x}", u32::from(ch)));
+    }
+    literal
+}
+
+/// JS binding `var` to the focused element, looking through open shadow roots.
+pub fn deep_active_element_js(var: &str) -> String {
+    format!(
+        r"var {var} = document.activeElement || document.body;
+                while ({var}.shadowRoot && {var}.shadowRoot.activeElement) {{
+                    {var} = {var}.shadowRoot.activeElement;
+                }}"
+    )
+}
+
+/// JS expression that is true when `el` takes typed text: a textarea or a text-like input.
+pub fn is_text_field_js(el: &str) -> String {
+    format!(
+        "({el}.tagName === 'TEXTAREA' || ({el}.tagName === 'INPUT' && \
+         ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf({el}.type) !== -1))"
+    )
+}
+
+/// JS dispatching a synthetic special-key `KeyboardEvent` plus the editing, radio and line-break
 /// side-effects an untrusted event can't drive itself, skipped when a handler cancels the keydown.
 pub fn build_special_key_script(
     js_key: &str,
@@ -133,155 +158,26 @@ pub fn build_special_key_script(
     is_down: bool,
     modifiers: &ModifierState,
 ) -> String {
-    let event_type = if is_down { "keydown" } else { "keyup" };
-    let ctrl_key = modifiers.ctrl;
-    let meta_key = modifiers.meta;
-    let shift_key = modifiers.shift;
-    let alt_key = modifiers.alt;
-
-    if is_down && (js_key == "Backspace" || js_key == "Delete") {
-        format!(
-            r"(function() {{
-                    var activeEl = document.activeElement || document.body;
-
-                    var keydownEvent = new KeyboardEvent('keydown', {{
-                        key: '{js_key}',
-                        code: '{js_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    if (!activeEl.dispatchEvent(keydownEvent)) {{
-                        return true;
-                    }}
-
-                    if (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') {{
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                            activeEl.tagName === 'INPUT'
-                                ? window.HTMLInputElement.prototype
-                                : window.HTMLTextAreaElement.prototype,
-                            'value'
-                        ).set;
-
-                        var currentValue = activeEl.value;
-                        var selStart = activeEl.selectionStart;
-                        var selEnd = activeEl.selectionEnd;
-                        var newValue;
-                        var inputType;
-
-                        if (selStart !== selEnd) {{
-                            newValue = currentValue.slice(0, selStart) + currentValue.slice(selEnd);
-                            inputType = 'deleteContentBackward';
-                            nativeInputValueSetter.call(activeEl, newValue);
-                            activeEl.setSelectionRange(selStart, selStart);
-                        }} else if ('{js_key}' === 'Backspace' && selStart > 0) {{
-                            newValue = currentValue.slice(0, selStart - 1) + currentValue.slice(selStart);
-                            inputType = 'deleteContentBackward';
-                            nativeInputValueSetter.call(activeEl, newValue);
-                            activeEl.setSelectionRange(selStart - 1, selStart - 1);
-                        }} else if ('{js_key}' === 'Delete' && selStart < currentValue.length) {{
-                            newValue = currentValue.slice(0, selStart) + currentValue.slice(selStart + 1);
-                            inputType = 'deleteContentForward';
-                            nativeInputValueSetter.call(activeEl, newValue);
-                            activeEl.setSelectionRange(selStart, selStart);
-                        }} else {{
-                            return true;
-                        }}
-
-                        var inputEvent = new InputEvent('input', {{
-                            bubbles: true,
-                            cancelable: true,
-                            inputType: inputType
-                        }});
-                        activeEl.dispatchEvent(inputEvent);
-                    }}
-
-                    return true;
-                }})()"
-        )
-    } else if is_down
-        && (js_key == "ArrowDown"
-            || js_key == "ArrowUp"
-            || js_key == "ArrowLeft"
-            || js_key == "ArrowRight")
-    {
-        let go_forward = js_key == "ArrowDown" || js_key == "ArrowRight";
-        format!(
-            r#"(function() {{
-                    var activeEl = document.activeElement || document.body;
-
-                    var keydownEvent = new KeyboardEvent('keydown', {{
-                        key: '{js_key}',
-                        code: '{js_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    if (!activeEl.dispatchEvent(keydownEvent)) {{
-                        return true;
-                    }}
-
-                    if (activeEl.tagName === 'INPUT' && activeEl.type === 'radio' && activeEl.name) {{
-                        var name = activeEl.name;
-                        var radios = Array.from(document.querySelectorAll("input[type='radio'][name='" + name + "']"));
-                        var currentIndex = radios.indexOf(activeEl);
-
-                        if (currentIndex !== -1 && radios.length > 1) {{
-                            var nextIndex;
-                            if ({go_forward}) {{
-                                nextIndex = (currentIndex + 1) % radios.length;
-                            }} else {{
-                                nextIndex = (currentIndex - 1 + radios.length) % radios.length;
-                            }}
-
-                            var nextRadio = radios[nextIndex];
-                            nextRadio.checked = true;
-                            nextRadio.focus();
-
-                            var changeEvent = new Event('change', {{ bubbles: true }});
-                            nextRadio.dispatchEvent(changeEvent);
-                        }}
-                    }}
-
-                    return true;
-                }})()"#
-        )
-    } else {
-        format!(
-            r"(function() {{
-                    var event = new KeyboardEvent('{event_type}', {{
-                        key: '{js_key}',
-                        code: '{js_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    var activeEl = document.activeElement || document.body;
-                    activeEl.dispatchEvent(event);
-                    return true;
-                }})()"
-        )
-    }
+    let default_action = match js_key {
+        _ if !is_down => String::new(),
+        "Backspace" | "Delete" => delete_js(js_key == "Backspace"),
+        "ArrowDown" | "ArrowRight" => radio_step_js(true),
+        "ArrowUp" | "ArrowLeft" => radio_step_js(false),
+        "Enter" => line_break_js(modifiers.shift),
+        _ => String::new(),
+    };
+    key_event_script(
+        js_key,
+        js_code,
+        key_code,
+        is_down,
+        modifiers,
+        &default_action,
+    )
 }
 
-/// JS dispatching a synthetic printable-character `KeyboardEvent` plus the text insertion and
-/// Ctrl/Meta+A select-all an untrusted event can't drive itself, skipped when a handler cancels the
-/// keydown.
+/// JS dispatching a synthetic printable-character `KeyboardEvent` plus the insertion or Ctrl/Meta+A
+/// select-all an untrusted event can't drive itself, skipped when a handler cancels the keydown.
 pub fn build_regular_key_script(
     key: &str,
     code: &str,
@@ -301,139 +197,214 @@ pub fn build_printable_key_script(
     is_down: bool,
     modifiers: &ModifierState,
 ) -> String {
-    let ch = key.chars().next().unwrap_or(' ');
-    let event_type = if is_down { "keydown" } else { "keyup" };
-
-    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
-    let escaped_code = code.replace('\\', "\\\\").replace('\'', "\\'");
-
-    let ctrl_key = modifiers.ctrl;
-    let meta_key = modifiers.meta;
-    let shift_key = modifiers.shift;
-    let alt_key = modifiers.alt;
-
-    let is_select_all = is_down && (ch == 'a' || ch == 'A') && (ctrl_key || meta_key);
-    let insert_text = insert_text_js("activeEl", &format!("'{escaped_key}'"));
-
-    if is_select_all {
-        format!(
-            r"(function() {{
-                    var activeEl = document.activeElement || document.body;
-
-                    var keydownEvent = new KeyboardEvent('keydown', {{
-                        key: '{escaped_key}',
-                        code: '{escaped_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    if (!activeEl.dispatchEvent(keydownEvent)) {{
-                        return true;
-                    }}
-
-                    if (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') {{
-                        activeEl.select();
-                    }} else {{
-                        document.execCommand('selectAll', false, null);
-                    }}
-
-                    return true;
-                }})()"
-        )
-    } else if is_down {
-        format!(
-            r"(function() {{
-                    var activeEl = document.activeElement || document.body;
-
-                    var keydownEvent = new KeyboardEvent('keydown', {{
-                        key: '{escaped_key}',
-                        code: '{escaped_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    if (!activeEl.dispatchEvent(keydownEvent)) {{
-                        return true;
-                    }}
-
-                    if (!{ctrl_key} && !{meta_key} && !{alt_key}) {{
-                        {insert_text}
-                    }}
-
-                    return true;
-                }})()"
-        )
+    let is_select_all = matches!(key, "a" | "A") && (modifiers.ctrl || modifiers.meta);
+    let default_action = if !is_down {
+        String::new()
+    } else if is_select_all {
+        select_all_js()
+    } else if modifiers.ctrl || modifiers.meta || modifiers.alt {
+        String::new()
     } else {
-        format!(
-            r"(function() {{
-                    var activeEl = document.activeElement || document.body;
-                    var event = new KeyboardEvent('{event_type}', {{
-                        key: '{escaped_key}',
-                        code: '{escaped_code}',
-                        keyCode: {key_code},
-                        which: {key_code},
-                        ctrlKey: {ctrl_key},
-                        metaKey: {meta_key},
-                        shiftKey: {shift_key},
-                        altKey: {alt_key},
-                        bubbles: true,
-                        cancelable: true
-                    }});
-                    activeEl.dispatchEvent(event);
-                    return true;
-                }})()"
-        )
-    }
+        insert_text_js("activeEl", &js_string(key))
+    };
+    key_event_script(key, code, key_code, is_down, modifiers, &default_action)
 }
 
-/// JS that focuses an element and appends `text` (inputs/textareas/contenteditable).
-pub fn build_send_keys_script(js_var: &str, text: &str) -> String {
-    let escaped = text
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('$', "\\$");
+/// JS dispatching one keydown or keyup to the deep focused element, then running `default_action`
+/// unless a handler canceled the event.
+fn key_event_script(
+    key: &str,
+    code: &str,
+    key_code: u32,
+    is_down: bool,
+    modifiers: &ModifierState,
+    default_action: &str,
+) -> String {
+    let active_element = deep_active_element_js("activeEl");
+    let event_type = if is_down { "keydown" } else { "keyup" };
+    let key = js_string(key);
+    let code = js_string(code);
+    let ModifierState {
+        ctrl,
+        shift,
+        alt,
+        meta,
+    } = *modifiers;
     format!(
         r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
+                {active_element}
+                var keyEvent = new KeyboardEvent('{event_type}', {{
+                    key: {key},
+                    code: {code},
+                    keyCode: {key_code},
+                    which: {key_code},
+                    ctrlKey: {ctrl},
+                    metaKey: {meta},
+                    shiftKey: {shift},
+                    altKey: {alt},
+                    bubbles: true,
+                    cancelable: true
+                }});
+                if (!activeEl.dispatchEvent(keyEvent)) {{
+                    return true;
                 }}
-                el.focus();
-
-                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
-                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
-                        'value'
-                    ).set;
-
-                    var newValue = el.value + `{escaped}`;
-                    nativeInputValueSetter.call(el, newValue);
-
-                    var inputEvent = new InputEvent('input', {{
-                        bubbles: true,
-                        cancelable: true,
-                        inputType: 'insertText',
-                        data: `{escaped}`
-                    }});
-                    el.dispatchEvent(inputEvent);
-
-                    var changeEvent = new Event('change', {{ bubbles: true }});
-                    el.dispatchEvent(changeEvent);
-                }} else if (el.isContentEditable) {{
-                    document.execCommand('insertText', false, `{escaped}`);
-                }}
+                {default_action}
                 return true;
             }})()"
+    )
+}
+
+/// JS for Backspace (`backward`) or Delete in a text field: removes the selection, or the character
+/// before or after the caret, and fires `input`.
+fn delete_js(backward: bool) -> String {
+    let text_field = is_text_field_js("activeEl");
+    let (edge_check, removed_start, removed_end, input_type) = if backward {
+        (
+            "selStart > 0",
+            "selStart - 1",
+            "selStart",
+            "deleteContentBackward",
+        )
+    } else {
+        (
+            "selStart < currentValue.length",
+            "selStart",
+            "selStart + 1",
+            "deleteContentForward",
+        )
+    };
+    format!(
+        r"if ({text_field}) {{
+                    var currentValue = activeEl.value;
+                    var selStart = null;
+                    var selEnd = null;
+                    try {{
+                        selStart = activeEl.selectionStart;
+                        selEnd = activeEl.selectionEnd;
+                    }} catch (e) {{}}
+                    if (typeof selStart === 'number' && typeof selEnd === 'number') {{
+                        var removeStart = selStart;
+                        var removeEnd = selEnd;
+                        if (selStart === selEnd) {{
+                            removeStart = {edge_check} ? {removed_start} : selStart;
+                            removeEnd = {edge_check} ? {removed_end} : selStart;
+                        }}
+                        if (removeStart !== removeEnd) {{
+                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                activeEl.tagName === 'INPUT'
+                                    ? window.HTMLInputElement.prototype
+                                    : window.HTMLTextAreaElement.prototype,
+                                'value'
+                            ).set;
+                            nativeInputValueSetter.call(
+                                activeEl,
+                                currentValue.slice(0, removeStart) + currentValue.slice(removeEnd)
+                            );
+                            activeEl.setSelectionRange(removeStart, removeStart);
+                            activeEl.dispatchEvent(new InputEvent('input', {{
+                                bubbles: true,
+                                cancelable: true,
+                                inputType: '{input_type}'
+                            }}));
+                        }}
+                    }}
+                }}"
+    )
+}
+
+/// JS moving the checked radio to the next (`forward`) or previous button of the focused radio's
+/// group, firing `change`.
+fn radio_step_js(forward: bool) -> String {
+    format!(
+        r#"if (activeEl.tagName === 'INPUT' && activeEl.type === 'radio' && activeEl.name) {{
+                    var radios = Array.from(activeEl.getRootNode().querySelectorAll(
+                        'input[type="radio"][name="' + CSS.escape(activeEl.name) + '"]'
+                    ));
+                    var currentIndex = radios.indexOf(activeEl);
+                    if (currentIndex !== -1 && radios.length > 1) {{
+                        var nextIndex = {forward}
+                            ? (currentIndex + 1) % radios.length
+                            : (currentIndex - 1 + radios.length) % radios.length;
+                        var nextRadio = radios[nextIndex];
+                        nextRadio.checked = true;
+                        nextRadio.focus();
+                        nextRadio.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                }}"#
+    )
+}
+
+/// JS for Enter: a line break in a textarea or contenteditable (Shift+Enter inserts a `<br>`
+/// rather than a new paragraph). Inputs get none.
+fn line_break_js(shift: bool) -> String {
+    let insert_newline = insert_text_js("activeEl", &js_string("\n"));
+    let command = if shift {
+        "insertLineBreak"
+    } else {
+        "insertParagraph"
+    };
+    format!(
+        r"if (activeEl.tagName === 'TEXTAREA') {{
+                    {insert_newline}
+                }} else if (activeEl.isContentEditable) {{
+                    document.execCommand('{command}', false, null);
+                }}"
+    )
+}
+
+/// JS for Ctrl/Meta+A: selects a text field's value, or everything else.
+fn select_all_js() -> String {
+    let text_field = is_text_field_js("activeEl");
+    format!(
+        r"if ({text_field}) {{
+                    activeEl.select();
+                }} else {{
+                    document.execCommand('selectAll', false, null);
+                }}"
+    )
+}
+
+/// JS inserting the string expression `text_js` at `el`'s selection, replacing any selected range,
+/// and firing `input` if the value changed. Only text fields and contenteditable take text.
+fn insert_text_js(el: &str, text_js: &str) -> String {
+    let text_field = is_text_field_js(el);
+    format!(
+        r"var insertedText = {text_js};
+                if ({text_field}) {{
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        {el}.tagName === 'INPUT'
+                            ? window.HTMLInputElement.prototype
+                            : window.HTMLTextAreaElement.prototype,
+                        'value'
+                    ).set;
+                    var currentValue = {el}.value;
+                    var selStart = null;
+                    var selEnd = null;
+                    try {{
+                        selStart = {el}.selectionStart;
+                        selEnd = {el}.selectionEnd;
+                    }} catch (e) {{}}
+                    if (typeof selStart === 'number' && typeof selEnd === 'number') {{
+                        nativeInputValueSetter.call(
+                            {el},
+                            currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)
+                        );
+                        var caret = selStart + insertedText.length;
+                        {el}.setSelectionRange(caret, caret);
+                    }} else {{
+                        nativeInputValueSetter.call({el}, currentValue + insertedText);
+                    }}
+                    if ({el}.value !== currentValue) {{
+                        {el}.dispatchEvent(new InputEvent('input', {{
+                            bubbles: true,
+                            cancelable: true,
+                            inputType: 'insertText',
+                            data: insertedText
+                        }}));
+                    }}
+                }} else if ({el}.isContentEditable) {{
+                    document.execCommand('insertText', false, insertedText);
+                }}"
     )
 }
 
@@ -472,6 +443,15 @@ pub struct HeldModifiers {
 }
 
 impl HeldModifiers {
+    /// The modifiers among `keys`, e.g. a session's keys still pressed from earlier actions.
+    pub fn from_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut held = Self::default();
+        for key in keys {
+            held.press(key);
+        }
+        held
+    }
+
     /// Record a key press; returns whether it newly held a modifier.
     pub fn press(&mut self, key: &str) -> bool {
         is_modifier_key(key) && self.keys.insert(key.to_string())
@@ -516,9 +496,8 @@ pub enum SendKeysStep {
     },
 }
 
-/// Turn send-keys text into ordered steps. A modifier key stays held until the null key or the end
-/// of the text (W3C Element Send Keys). While Control, Alt or Meta is held, text is pressed key by
-/// key as shortcuts instead of being typed; Shift alone doesn't change the typed text.
+/// Send-keys text as ordered steps: modifiers stay held until the null key or the end (W3C), and
+/// text typed under Control, Alt or Meta is pressed key by key as shortcuts.
 pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
     let mut steps = Vec::new();
     let mut held = HeldModifiers::default();
@@ -551,13 +530,22 @@ pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
     steps
 }
 
-/// The text to type when a plan presses no keys, so it can go in one step.
-pub fn plain_text(steps: &[SendKeysStep]) -> Option<&str> {
-    match steps {
-        [] => Some(""),
-        [SendKeysStep::Text(text)] => Some(text),
-        _ => None,
+/// The key-ups for the modifiers still held after the first `done` steps, so a request that fails
+/// part-way doesn't leave them pressed.
+pub fn modifier_releases(steps: &[SendKeysStep], done: usize) -> Vec<SendKeysStep> {
+    let mut held = HeldModifiers::default();
+    for step in steps.iter().take(done) {
+        if let SendKeysStep::Key { value, is_down, .. } = step {
+            if *is_down {
+                held.press(value);
+            } else {
+                held.release(value);
+            }
+        }
     }
+    let mut releases = Vec::new();
+    release_held_modifiers(&mut releases, &mut held);
+    releases
 }
 
 fn push_text(steps: &mut Vec<SendKeysStep>, run: &str) {
@@ -591,60 +579,60 @@ fn release_held_modifiers(steps: &mut Vec<SendKeysStep>, held: &mut HeldModifier
     }
 }
 
-/// JS that focuses the stored element and puts the caret at the end, so typing continues after the
-/// existing content. A contenteditable that already had focus keeps its caret. Throws if the
-/// element is stale; runs before any keystroke commits.
+/// JS focusing the stored element (caret at the end only if it wasn't focused) and returning its
+/// value, or `null` unless it's a text field. Throws if the element is stale.
 pub fn build_send_keys_focus_script(js_var: &str) -> String {
+    let active_element = deep_active_element_js("activeEl");
+    let text_field = is_text_field_js("el");
     format!(
         r"(function() {{
                 var el = window.{js_var};
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
-                var wasFocused = document.activeElement === el;
+                {active_element}
+                var wasFocused = activeEl === el;
                 el.focus();
-                try {{
-                    if (typeof el.setSelectionRange === 'function') {{
-                        var end = (el.value || '').length;
-                        el.setSelectionRange(end, end);
-                    }} else if (el.isContentEditable && !wasFocused) {{
-                        var range = document.createRange();
-                        range.selectNodeContents(el);
-                        range.collapse(false);
-                        var selection = window.getSelection();
-                        selection.removeAllRanges();
-                        selection.addRange(range);
-                    }}
-                }} catch (e) {{}}
-                return true;
+                if (!wasFocused) {{
+                    try {{
+                        if ({text_field}) {{
+                            el.setSelectionRange(el.value.length, el.value.length);
+                        }} else if (el.isContentEditable) {{
+                            var range = document.createRange();
+                            range.selectNodeContents(el);
+                            range.collapse(false);
+                            var selection = window.getSelection();
+                            selection.removeAllRanges();
+                            selection.addRange(range);
+                        }}
+                    }} catch (e) {{}}
+                }}
+                return {text_field} ? el.value : null;
             }})()"
     )
 }
 
-/// JS that best-effort refocuses the stored element before a key, since a page handler may have
-/// moved focus. A focus handler that redirects focus wins: the key follows focus.
+/// JS that refocuses the stored element before a key and returns whether it is now the focused
+/// element; keys must not land on whatever else has focus.
 pub fn build_refocus_script(js_var: &str) -> String {
+    let active_element = deep_active_element_js("activeEl");
     format!(
         r"(function() {{
                 var el = window.{js_var};
-                if (el && el.isConnected) {{
-                    el.focus();
+                if (!el || !el.isConnected) {{
+                    return false;
                 }}
-                return true;
+                el.focus();
+                {active_element}
+                return activeEl === el;
             }})()"
     )
 }
 
-/// JS that inserts a printable run into the stored element at its selection, replacing any selected
-/// range, and fires `input`. Best-effort: it skips silently when the element is gone — earlier
-/// keystrokes in the same request already committed, so throwing here would misreport a partial
-/// success — and fires no `change`; the caller dispatches that once after the whole sequence.
+/// JS inserting a printable run into the stored element at its selection; it skips a detached
+/// element rather than throw, since earlier keystrokes already committed.
 pub fn build_insert_run_script(js_var: &str, run: &str) -> String {
-    let escaped = run
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('$', "\\$");
-    let insert_text = insert_text_js("el", &format!("`{escaped}`"));
+    let insert_text = insert_text_js("el", &js_string(run));
     format!(
         r"(function() {{
                 var el = window.{js_var};
@@ -658,53 +646,14 @@ pub fn build_insert_run_script(js_var: &str, run: &str) -> String {
     )
 }
 
-/// JS statements inserting the string expression `text_js` into `el` at its selection, replacing
-/// any selected range, then firing `input`. Inputs without a selection API (e.g. `email`) append.
-fn insert_text_js(el: &str, text_js: &str) -> String {
-    format!(
-        r"var insertedText = {text_js};
-                if ({el}.tagName === 'INPUT' || {el}.tagName === 'TEXTAREA') {{
-                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        {el}.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
-                        'value'
-                    ).set;
-                    var currentValue = {el}.value;
-                    var selStart = null;
-                    var selEnd = null;
-                    try {{
-                        selStart = {el}.selectionStart;
-                        selEnd = {el}.selectionEnd;
-                    }} catch (e) {{}}
-                    if (typeof selStart === 'number' && typeof selEnd === 'number') {{
-                        nativeInputValueSetter.call(
-                            {el},
-                            currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)
-                        );
-                        var caret = selStart + insertedText.length;
-                        {el}.setSelectionRange(caret, caret);
-                    }} else {{
-                        nativeInputValueSetter.call({el}, currentValue + insertedText);
-                    }}
-                    {el}.dispatchEvent(new InputEvent('input', {{
-                        bubbles: true,
-                        cancelable: true,
-                        inputType: 'insertText',
-                        data: insertedText
-                    }}));
-                }} else if ({el}.isContentEditable) {{
-                    document.execCommand('insertText', false, insertedText);
-                }}"
-    )
-}
-
-/// JS firing the single trailing `change` a split send-keys sequence owes an input/textarea.
-/// Best-effort: skips if the element detached mid-sequence, because the keystrokes already
-/// committed and a stale error would make a caller retry duplicate the typing.
-pub fn build_send_keys_change_script(js_var: &str) -> String {
+/// JS firing one `change` if the stored text field's value differs from `initial_value`; it skips a
+/// detached element so a retry can't duplicate keystrokes that already committed.
+pub fn build_send_keys_change_script(js_var: &str, initial_value: &str) -> String {
+    let initial_value = js_string(initial_value);
     format!(
         r"(function() {{
                 var el = window.{js_var};
-                if (el && el.isConnected && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {{
+                if (el && el.isConnected && el.value !== {initial_value}) {{
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
                 return true;
@@ -893,9 +842,10 @@ mod tests {
         let none = ModifierState::default();
         let script = build_special_key_script("PageDown", "PageDown", 34, true, &none);
         assert!(script.contains("new KeyboardEvent('keydown'"));
-        assert!(script.contains("key: 'PageDown'"));
+        assert!(script.contains("key: \"PageDown\""));
         assert!(script.contains("keyCode: 34"));
         assert!(script.contains("shiftKey: false"));
+        assert_eq!(script.matches("new KeyboardEvent(").count(), 1);
 
         let up = build_special_key_script("PageDown", "PageDown", 34, false, &none);
         assert!(up.contains("new KeyboardEvent('keyup'"));
@@ -924,13 +874,14 @@ mod tests {
     #[test]
     fn build_regular_key_script_carries_modifiers_and_value_mutation() {
         let script = build_regular_key_script("a", "KeyA", true, &mods(false, false, false, false));
-        assert!(script.contains("key: 'a'"));
+        assert!(script.contains("key: \"a\""));
         assert!(script.contains("keyCode: 97"));
         assert!(script.contains("inputType: 'insertText'"));
 
         let select_all =
             build_regular_key_script("a", "KeyA", true, &mods(true, false, false, false));
         assert!(select_all.contains("activeEl.select()"));
+        assert!(!select_all.contains("insertedText"));
     }
 
     #[test]
@@ -942,10 +893,10 @@ mod tests {
             true,
             &mods(false, false, false, false),
         );
-        assert!(script.contains("key: '5'"));
-        assert!(script.contains("code: 'Numpad5'"));
+        assert!(script.contains("key: \"5\""));
+        assert!(script.contains("code: \"Numpad5\""));
         assert!(script.contains("keyCode: 101"));
-        assert!(script.contains("var insertedText = '5'"));
+        assert!(script.contains("var insertedText = \"5\""));
     }
 
     #[test]
@@ -967,6 +918,59 @@ mod tests {
                 "currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)"
             ));
             assert!(script.contains("setSelectionRange(caret, caret)"));
+            assert!(
+                script.contains("if (activeEl.value !== currentValue)")
+                    || script.contains("if (el.value !== currentValue)")
+            );
+        }
+    }
+
+    #[test]
+    fn only_text_fields_and_editors_take_typed_text() {
+        let field = is_text_field_js("el");
+        assert!(field.contains("el.tagName === 'TEXTAREA'"));
+        assert!(field.contains(
+            "['text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf(el.type)"
+        ));
+        let script = build_insert_run_script("__wd_el_abc", "x");
+        assert!(script.contains(&format!("if ({field})")));
+        assert!(!script.contains("el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'"));
+    }
+
+    #[test]
+    fn js_string_escapes_line_breaks_quotes_and_markup() {
+        let text = "a'\"\\\n\u{2028}\u{2029}</script>";
+        let literal = js_string(text);
+        assert!(literal.starts_with('"') && literal.ends_with('"'));
+        for raw in ['\n', '\u{2028}', '\u{2029}', '<'] {
+            assert!(!literal.contains(raw), "{literal:?} contains {raw:?}");
+        }
+        assert_eq!(serde_json::from_str::<String>(&literal).unwrap(), text);
+    }
+
+    #[test]
+    fn key_text_is_spliced_as_escaped_literals() {
+        let none = mods(false, false, false, false);
+        let newline = build_regular_key_script("\n", "\n", true, &none);
+        assert!(newline.contains(&format!("key: {}", js_string("\n"))));
+        assert!(newline.contains(&format!("var insertedText = {}", js_string("\n"))));
+        let run = build_insert_run_script("v", "a`$\\b\n'");
+        assert!(run.contains(&format!("var insertedText = {}", js_string("a`$\\b\n'"))));
+    }
+
+    #[test]
+    fn key_scripts_target_the_deep_active_element() {
+        let none = mods(false, false, false, false);
+        for script in [
+            build_special_key_script("Enter", "Enter", 13, true, &none),
+            build_printable_key_script(" ", "Space", 32, true, &none),
+            build_refocus_script("v"),
+            build_send_keys_focus_script("v"),
+        ] {
+            assert!(
+                script.contains("activeEl.shadowRoot.activeElement"),
+                "{script}"
+            );
         }
     }
 
@@ -974,8 +978,7 @@ mod tests {
     fn default_actions_wait_for_an_uncanceled_keydown() {
         let none = mods(false, false, false, false);
         let ctrl = mods(true, false, false, false);
-        let guard =
-            "if (!activeEl.dispatchEvent(keydownEvent)) {\n                        return true;";
+        let guard = "if (!activeEl.dispatchEvent(keyEvent)) {";
         for (script, side_effect) in [
             (
                 build_printable_key_script(" ", "Space", 32, true, &none),
@@ -1001,6 +1004,10 @@ mod tests {
                 build_special_key_script("ArrowDown", "ArrowDown", 40, true, &none),
                 "nextRadio.checked",
             ),
+            (
+                build_special_key_script("Enter", "Enter", 13, true, &none),
+                "insertParagraph",
+            ),
         ] {
             let guard_at = script
                 .find(guard)
@@ -1010,17 +1017,46 @@ mod tests {
                 guard_at < effect_at,
                 "{side_effect} runs before the guard in {script}"
             );
-            assert!(!script.contains("activeEl.dispatchEvent(keydownEvent);"));
+            assert!(!script.contains("activeEl.dispatchEvent(keyEvent);"));
         }
     }
 
     #[test]
-    fn build_send_keys_script_focuses_and_inserts() {
-        let script = build_send_keys_script("__wd_el_abc", "hi");
-        assert!(script.contains("window.__wd_el_abc"));
-        assert!(script.contains("el.focus()"));
-        assert!(script.contains("`hi`"));
-        assert!(script.contains("new Event('change'"));
+    fn enter_breaks_lines_in_textareas_and_editors_only() {
+        let none = mods(false, false, false, false);
+        let shift = mods(false, true, false, false);
+        let enter = build_special_key_script("Enter", "Enter", 13, true, &none);
+        assert!(enter.contains("if (activeEl.tagName === 'TEXTAREA')"));
+        assert!(enter.contains(&format!("var insertedText = {}", js_string("\n"))));
+        assert!(enter.contains("document.execCommand('insertParagraph', false, null)"));
+        let shift_enter = build_special_key_script("Enter", "Enter", 13, true, &shift);
+        assert!(shift_enter.contains("document.execCommand('insertLineBreak', false, null)"));
+        let enter_up = build_special_key_script("Enter", "Enter", 13, false, &none);
+        assert!(!enter_up.contains("insertedText"));
+    }
+
+    #[test]
+    fn delete_keys_only_edit_text_fields_with_a_selection_api() {
+        let none = mods(false, false, false, false);
+        let backspace = build_special_key_script("Backspace", "Backspace", 8, true, &none);
+        assert!(backspace.contains(&format!("if ({})", is_text_field_js("activeEl"))));
+        assert!(backspace.contains("typeof selStart === 'number'"));
+        assert!(backspace.contains("deleteContentBackward"));
+        let delete = build_special_key_script("Delete", "Delete", 46, true, &none);
+        assert!(delete.contains("deleteContentForward"));
+    }
+
+    #[test]
+    fn radio_navigation_escapes_the_group_name() {
+        let script = build_special_key_script(
+            "ArrowDown",
+            "ArrowDown",
+            40,
+            true,
+            &mods(false, false, false, false),
+        );
+        assert!(script.contains("CSS.escape(activeEl.name)"));
+        assert!(script.contains("activeEl.getRootNode().querySelectorAll("));
     }
 
     #[test]
@@ -1078,15 +1114,40 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_drops_null_keys() {
+    fn plan_send_keys_drops_null_keys() {
         assert_eq!(plan_send_keys(&format!("a{NULL_KEY}b")), vec![text("ab")]);
+        assert_eq!(plan_send_keys(NULL_KEY), vec![]);
+    }
+
+    #[test]
+    fn held_modifiers_start_from_keys_still_pressed() {
+        let pressed = vec![
+            SHIFT.to_string(),
+            "a".to_string(),
+            CONTROL_RIGHT.to_string(),
+        ];
+        let held = HeldModifiers::from_keys(&pressed);
+        assert_eq!(held.state(), mods(true, true, false, false));
+        assert_eq!(held.keys(), vec![SHIFT, CONTROL_RIGHT]);
+    }
+
+    #[test]
+    fn modifier_releases_let_go_of_modifiers_held_when_a_step_fails() {
+        let none = ModifierState::default();
+        let ctrl = mods(true, false, false, false);
+        let steps = plan_send_keys(&format!("{SHIFT}{CONTROL}a{ENTER}"));
+        assert_eq!(modifier_releases(&steps, 0), vec![]);
+        assert_eq!(modifier_releases(&steps, 1), vec![key(SHIFT, false, none)]);
         assert_eq!(
-            plain_text(&plan_send_keys(&format!("a{NULL_KEY}b"))),
-            Some("ab")
+            modifier_releases(&steps, 3),
+            vec![key(SHIFT, false, ctrl), key(CONTROL, false, none)]
         );
-        assert_eq!(plain_text(&plan_send_keys(NULL_KEY)), Some(""));
-        assert_eq!(plain_text(&plan_send_keys("")), Some(""));
-        assert_eq!(plain_text(&plan_send_keys(&format!("hi{ENTER}"))), None);
+        let all = steps.len();
+        assert_eq!(
+            modifier_releases(&steps, all - 1),
+            vec![key(CONTROL, false, none)]
+        );
+        assert_eq!(modifier_releases(&steps, all), vec![]);
     }
 
     #[test]
@@ -1209,34 +1270,44 @@ mod tests {
     }
 
     #[test]
-    fn build_send_keys_focus_script_guards_stale_and_moves_caret() {
+    fn build_send_keys_focus_script_moves_the_caret_only_into_an_unfocused_element() {
         let script = build_send_keys_focus_script("__wd_el_abc");
         assert!(script.contains("throw new Error('stale element reference')"));
         assert!(script.contains("el.focus()"));
-        assert!(script.contains("setSelectionRange(end, end)"));
-        assert!(script.contains("el.isContentEditable && !wasFocused"));
-        assert!(script.contains("range.collapse(false)"));
+        let unfocused = script.find("if (!wasFocused) {").unwrap();
+        let caret = script
+            .find("el.setSelectionRange(el.value.length, el.value.length)")
+            .unwrap();
+        let editor_caret = script.find("range.collapse(false)").unwrap();
+        assert!(unfocused < caret && unfocused < editor_caret);
+        assert!(script.contains(&format!(
+            "return {} ? el.value : null;",
+            is_text_field_js("el")
+        )));
+    }
+
+    #[test]
+    fn build_refocus_script_reports_whether_the_element_took_focus() {
+        let script = build_refocus_script("__wd_el_abc");
+        assert!(script.contains("el.focus()"));
+        assert!(script.contains("return activeEl === el;"));
+        assert!(script.contains("return false;"));
     }
 
     #[test]
     fn build_insert_run_script_inserts_fires_input_and_defers_change() {
         let script = build_insert_run_script("__wd_el_abc", "hi");
         assert!(script.contains("window.__wd_el_abc"));
-        assert!(script.contains("var insertedText = `hi`"));
+        assert!(script.contains("var insertedText = \"hi\""));
         assert!(script.contains("inputType: 'insertText'"));
         assert!(script.contains("document.execCommand('insertText', false, insertedText)"));
         assert!(!script.contains("new Event('change'"));
     }
 
     #[test]
-    fn build_insert_run_script_escapes_backtick_dollar_and_backslash() {
-        let script = build_insert_run_script("v", "a`$\\b");
-        assert!(script.contains(r"a\`\$\\b"));
-    }
-
-    #[test]
-    fn build_send_keys_change_script_fires_change_without_throwing() {
-        let script = build_send_keys_change_script("__wd_el_abc");
+    fn build_send_keys_change_script_fires_change_only_for_a_changed_value() {
+        let script = build_send_keys_change_script("__wd_el_abc", "it's\n");
+        assert!(script.contains(&format!("el.value !== {}", js_string("it's\n"))));
         assert!(script.contains("new Event('change'"));
         assert!(!script.contains("throw"));
     }

@@ -761,18 +761,29 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
 
     /// Click on element
     async fn click_element(&self, js_var: &str) -> Result<(), WebDriverErrorResponse> {
+        let active_element = crate::platform::key_input::deep_active_element_js("activeEl");
+        let text_field = crate::platform::key_input::is_text_field_js("el");
         let script = format!(
             r"(function() {{
                 var el = window.{js_var};
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
+                {active_element}
+                var wasFocused = activeEl === el;
                 el.scrollIntoView({{ block: 'center', inline: 'center' }});
                 el.click();
                 // Explicitly focus the element after click - programmatic click()
                 // doesn't always trigger focus like a real click would
                 if (typeof el.focus === 'function') {{
                     el.focus();
+                }}
+                // Typing after the click continues after the text: WebKit's focus() would select a
+                // fresh input's text or put a textarea's caret first.
+                if (!wasFocused && {text_field}) {{
+                    try {{
+                        el.setSelectionRange(el.value.length, el.value.length);
+                    }} catch (e) {{}}
                 }}
                 return true;
             }})()"
@@ -820,38 +831,57 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         js_var: &str,
         text: &str,
     ) -> Result<(), WebDriverErrorResponse> {
-        use crate::platform::key_input::SendKeysStep;
+        use crate::platform::key_input::{self, SendKeysStep};
 
-        let steps = crate::platform::key_input::plan_send_keys(text);
-        if let Some(plain) = crate::platform::key_input::plain_text(&steps) {
-            let script = crate::platform::key_input::build_send_keys_script(js_var, plain);
-            self.evaluate_js(&script).await?;
-            return Ok(());
-        }
-
-        let focus_script = crate::platform::key_input::build_send_keys_focus_script(js_var);
-        self.evaluate_js(&focus_script).await?;
-        let refocus_script = crate::platform::key_input::build_refocus_script(js_var);
-        for step in &steps {
-            match step {
-                SendKeysStep::Text(run) => {
-                    let script = crate::platform::key_input::build_insert_run_script(js_var, run);
-                    self.evaluate_js(&script).await?;
-                }
+        let focus_script = key_input::build_send_keys_focus_script(js_var);
+        let initial_value = extract_value(&self.evaluate_js(&focus_script).await?)?;
+        let steps = key_input::plan_send_keys(text);
+        let refocus_script = key_input::build_refocus_script(js_var);
+        for (done, step) in steps.iter().enumerate() {
+            let outcome = match step {
+                SendKeysStep::Text(run) => self
+                    .evaluate_js(&key_input::build_insert_run_script(js_var, run))
+                    .await
+                    .map(|_| ()),
                 SendKeysStep::Key {
                     value,
                     is_down,
                     modifiers,
                 } => {
-                    if *is_down {
-                        self.evaluate_js(&refocus_script).await?;
+                    let focused = if *is_down {
+                        self.evaluate_js(&refocus_script)
+                            .await
+                            .and_then(|result| extract_bool_value(&result))
+                    } else {
+                        Ok(true)
+                    };
+                    match focused {
+                        Ok(true) => self.dispatch_key_event(value, *is_down, modifiers).await,
+                        Ok(false) => Err(WebDriverErrorResponse::element_not_interactable(
+                            "element did not take keyboard focus, so the key cannot be sent to it",
+                        )),
+                        Err(error) => Err(error),
                     }
-                    self.dispatch_key_event(value, *is_down, modifiers).await?;
                 }
+            };
+            if let Err(error) = outcome {
+                for release in key_input::modifier_releases(&steps, done) {
+                    if let SendKeysStep::Key {
+                        value,
+                        is_down,
+                        modifiers,
+                    } = release
+                    {
+                        let _ = self.dispatch_key_event(&value, is_down, &modifiers).await;
+                    }
+                }
+                return Err(error);
             }
         }
-        let change_script = crate::platform::key_input::build_send_keys_change_script(js_var);
-        self.evaluate_js(&change_script).await?;
+        if let Some(initial_value) = initial_value.as_str() {
+            let change_script = key_input::build_send_keys_change_script(js_var, initial_value);
+            self.evaluate_js(&change_script).await?;
+        }
         Ok(())
     }
 
