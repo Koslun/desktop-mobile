@@ -216,7 +216,7 @@ describe('special keys (embedded)', () => {
       `scratch.innerHTML = '<div id="fresh-host"></div><div id="fresh-delegating-host"></div>';
       document.querySelector("#fresh-host").attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input">';
       document.querySelector("#fresh-delegating-host")
-        .attachShadow({ mode: "open", delegatesFocus: true }).innerHTML = '<input id="delegated-input">';`,
+        .attachShadow({ mode: "open", delegatesFocus: true }).innerHTML = '<input id="delegated-input" value="old">';`,
     );
     const input = browser.$('#fresh-host').shadow$('#shadow-input');
     await input.click();
@@ -225,7 +225,7 @@ describe('special keys (embedded)', () => {
     expect(await input.getValue()).toBe('xb');
 
     await browser.$('#fresh-delegating-host').addValue(`a${Key.Backspace}b`);
-    expect(await browser.$('#fresh-delegating-host').shadow$('#delegated-input').getValue()).toBe('b');
+    expect(await browser.$('#fresh-delegating-host').shadow$('#delegated-input').getValue()).toBe('oldb');
   });
 
   it('should send plain text after the existing content of an unfocused contenteditable', async () => {
@@ -241,12 +241,13 @@ describe('special keys (embedded)', () => {
     expect(await editorText()).toBe('lines');
   });
 
-  it('should type at the caret of a field that already has focus', async () => {
-    await browser.execute(
-      'var el = document.querySelector("#keys-input"); el.value = "abcd"; el.focus(); el.setSelectionRange(2, 2);',
+  it('should append to a prefilled field that already has focus', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<input id="fresh-focused" value="old">';
+      document.querySelector("#fresh-focused").focus();`,
     );
-    await browser.$('#keys-input').addValue('X');
-    expect(await browser.$('#keys-input').getValue()).toBe('abXcd');
+    await browser.$('#fresh-focused').addValue(' more');
+    expect(await browser.$('#fresh-focused').getValue()).toBe('old more');
   });
 
   it('should keep modifiers held across action calls', async () => {

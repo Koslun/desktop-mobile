@@ -632,20 +632,24 @@ pub fn plain_text(steps: &[SendKeysStep]) -> Option<&str> {
 pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&str>) -> String {
     let active_element = deep_active_element_js("activeEl");
     let text_field = is_text_field_js("el");
+    let receiver_text_field = is_text_field_js("receiver");
     let value_control = is_value_control_js("el");
     let typed = js_string(typed);
     let finish = match plain {
-        None => "return { status: 'focused', value: initialValue };".to_string(),
+        None => format!(
+            r"window.{js_var}__receiver = receiver;
+                return {{ status: 'focused', value: initialValue }};"
+        ),
         Some(text) => {
             let insert_text = if text.is_empty() {
                 String::new()
             } else {
-                insert_text_js("activeEl", &js_string(text))
+                insert_text_js("receiver", &js_string(text))
             };
             format!(
                 r"{insert_text}
-                if (initialValue !== null && el.value !== initialValue) {{
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                if (initialValue !== null && receiver.value !== initialValue) {{
+                    receiver.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
                 return {{ status: 'done' }};"
             )
@@ -687,19 +691,22 @@ pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&st
                     && focusTarget.parentElement.isContentEditable) {{
                     focusTarget = focusTarget.parentElement;
                 }}
-                focusTarget.focus();
-                if (!wasFocused) {{
+                // Text fields get the caret at the end before focus: typing appends, yet a select-on-focus
+                // handler still wins.
+                if ({text_field}) {{
                     try {{
-                        if ({text_field}) {{
-                            el.setSelectionRange(el.value.length, el.value.length);
-                        }} else if (el.isContentEditable) {{
-                            var range = document.createRange();
-                            range.selectNodeContents(el);
-                            range.collapse(false);
-                            var selection = window.getSelection();
-                            selection.removeAllRanges();
-                            selection.addRange(range);
-                        }}
+                        el.setSelectionRange(el.value.length, el.value.length);
+                    }} catch (e) {{}}
+                }}
+                focusTarget.focus();
+                if (!wasFocused && el.isContentEditable) {{
+                    try {{
+                        var range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        var selection = window.getSelection();
+                        selection.removeAllRanges();
+                        selection.addRange(range);
                     }} catch (e) {{}}
                 }}
                 {active_element}
@@ -711,7 +718,14 @@ pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&st
                 if (!focused) {{
                     return {{ status: 'unfocused' }};
                 }}
-                var initialValue = {text_field} ? el.value : null;
+                var receiver = activeEl;
+                // A field that focus was delegated to is only known now, so its caret moves after focus.
+                if (receiver !== el && {receiver_text_field}) {{
+                    try {{
+                        receiver.setSelectionRange(receiver.value.length, receiver.value.length);
+                    }} catch (e) {{}}
+                }}
+                var initialValue = {receiver_text_field} ? receiver.value : null;
                 {finish}
             }})()"
     )
@@ -731,13 +745,14 @@ pub fn build_insert_run_script(run: &str) -> String {
     )
 }
 
-/// JS firing one `change` if the stored text field's value differs from `initial_value`; it skips a
-/// detached element so a retry can't duplicate keystrokes that already committed.
+/// JS firing one `change` if the field that received the text no longer holds `initial_value`; it
+/// skips a detached field so a retry can't duplicate keystrokes that already committed.
 pub fn build_send_keys_change_script(js_var: &str, initial_value: &str) -> String {
     let initial_value = js_string(initial_value);
     format!(
         r"(function() {{
-                var el = window.{js_var};
+                var el = window.{js_var}__receiver;
+                delete window.{js_var}__receiver;
                 if (el && el.isConnected && el.value !== {initial_value}) {{
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
@@ -1370,16 +1385,26 @@ mod tests {
     }
 
     #[test]
-    fn build_send_keys_start_script_moves_the_caret_only_into_an_unfocused_element() {
+    fn build_send_keys_start_script_appends_to_the_field_that_receives_the_text() {
         let script = build_send_keys_start_script("__wd_el_abc", "", None);
-        assert!(script.contains("focusTarget.focus()"));
-        let unfocused = script.find("if (!wasFocused) {").unwrap();
-        let caret = script
+        let field_caret = script
             .find("el.setSelectionRange(el.value.length, el.value.length)")
             .unwrap();
+        let focus = script.find("focusTarget.focus()").unwrap();
         let editor_caret = script.find("range.collapse(false)").unwrap();
-        assert!(unfocused < caret && unfocused < editor_caret);
-        assert!(script.contains("return { status: 'focused', value: initialValue };"));
+        let delegated_caret = script
+            .find("receiver.setSelectionRange(receiver.value.length, receiver.value.length)")
+            .unwrap();
+        assert!(field_caret < focus && focus < editor_caret && editor_caret < delegated_caret);
+        assert!(script.contains("if (!wasFocused && el.isContentEditable)"));
+        assert!(script.contains(&format!(
+            "var initialValue = {} ? receiver.value : null;",
+            is_text_field_js("receiver")
+        )));
+        assert!(script.contains("window.__wd_el_abc__receiver = receiver;"));
+        let plain = build_send_keys_start_script("__wd_el_abc", "x", Some("x"));
+        assert!(plain.contains("receiver.value !== initialValue"));
+        assert!(plain.contains("receiver.dispatchEvent(new Event('change'"));
     }
 
     #[test]
@@ -1425,6 +1450,7 @@ mod tests {
     #[test]
     fn build_send_keys_change_script_fires_change_only_for_a_changed_value() {
         let script = build_send_keys_change_script("__wd_el_abc", "it's\n");
+        assert!(script.contains("var el = window.__wd_el_abc__receiver;"));
         assert!(script.contains(&format!("el.value !== {}", js_string("it's\n"))));
         assert!(script.contains("new Event('change'"));
         assert!(!script.contains("throw"));
