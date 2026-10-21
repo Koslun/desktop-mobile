@@ -770,20 +770,19 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                     throw new Error('stale element reference');
                 }}
                 {active_element}
-                var wasFocused = activeEl === el;
+                // A caret set before focus stops WebKit selecting a fresh field's text (or putting a
+                // textarea's caret first), while a select-on-focus handler still picks its own selection.
+                if (activeEl !== el && {text_field}) {{
+                    try {{
+                        el.setSelectionRange(el.value.length, el.value.length);
+                    }} catch (e) {{}}
+                }}
                 el.scrollIntoView({{ block: 'center', inline: 'center' }});
                 el.click();
                 // Explicitly focus the element after click - programmatic click()
                 // doesn't always trigger focus like a real click would
                 if (typeof el.focus === 'function') {{
                     el.focus();
-                }}
-                // Typing after the click continues after the text: WebKit's focus() would select a
-                // fresh input's text or put a textarea's caret first.
-                if (!wasFocused && {text_field}) {{
-                    try {{
-                        el.setSelectionRange(el.value.length, el.value.length);
-                    }} catch (e) {{}}
                 }}
                 return true;
             }})()"
@@ -833,9 +832,21 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
     ) -> Result<(), WebDriverErrorResponse> {
         use crate::platform::key_input::{self, SendKeysStep};
 
+        let steps = key_input::plan_send_keys(text);
+        let control_script =
+            key_input::build_set_control_value_script(js_var, &key_input::typed_text(&steps));
+        match extract_string_value(&self.evaluate_js(&control_script).await?)?.as_str() {
+            "set" => return Ok(()),
+            "immutable" => {
+                return Err(WebDriverErrorResponse::element_not_interactable(
+                    "form control is read-only or disabled, so its value cannot be set",
+                ))
+            }
+            _ => {}
+        }
+
         let focus_script = key_input::build_send_keys_focus_script(js_var);
         let initial_value = extract_value(&self.evaluate_js(&focus_script).await?)?;
-        let steps = key_input::plan_send_keys(text);
         let refocus_script = key_input::build_refocus_script(js_var);
         for (done, step) in steps.iter().enumerate() {
             let outcome = match step {

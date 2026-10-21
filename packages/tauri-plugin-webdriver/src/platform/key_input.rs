@@ -149,6 +149,22 @@ pub fn is_text_field_js(el: &str) -> String {
     )
 }
 
+/// JS expression that is true when typing may change `el`'s value: a text field that is neither
+/// read-only nor disabled.
+pub fn is_editable_text_field_js(el: &str) -> String {
+    let text_field = is_text_field_js(el);
+    format!("({text_field} && !{el}.readOnly && !{el}.disabled)")
+}
+
+/// JS expression that is true when `el` is a non-typeable form control whose value Send Keys sets
+/// directly (W3C), such as a date or colour input.
+pub fn is_value_control_js(el: &str) -> String {
+    format!(
+        "({el}.tagName === 'INPUT' && \
+         ['color', 'date', 'datetime-local', 'month', 'range', 'time', 'week'].indexOf({el}.type) !== -1)"
+    )
+}
+
 /// JS dispatching a synthetic special-key `KeyboardEvent` plus the editing, radio and line-break
 /// side-effects an untrusted event can't drive itself, skipped when a handler cancels the keydown.
 pub fn build_special_key_script(
@@ -243,6 +259,7 @@ fn key_event_script(
                     shiftKey: {shift},
                     altKey: {alt},
                     bubbles: true,
+                    composed: true,
                     cancelable: true
                 }});
                 if (!activeEl.dispatchEvent(keyEvent)) {{
@@ -254,10 +271,10 @@ fn key_event_script(
     )
 }
 
-/// JS for Backspace (`backward`) or Delete in a text field: removes the selection, or the character
-/// before or after the caret, and fires `input`.
+/// JS for Backspace (`backward`) or Delete in an editable text field: removes the selection, or the
+/// character before or after the caret, and fires `input`.
 fn delete_js(backward: bool) -> String {
-    let text_field = is_text_field_js("activeEl");
+    let text_field = is_editable_text_field_js("activeEl");
     let (edge_check, removed_start, removed_end, input_type) = if backward {
         (
             "selStart > 0",
@@ -303,6 +320,7 @@ fn delete_js(backward: bool) -> String {
                             activeEl.setSelectionRange(removeStart, removeStart);
                             activeEl.dispatchEvent(new InputEvent('input', {{
                                 bubbles: true,
+                                composed: true,
                                 cancelable: true,
                                 inputType: '{input_type}'
                             }}));
@@ -365,9 +383,9 @@ fn select_all_js() -> String {
 }
 
 /// JS inserting the string expression `text_js` at `el`'s selection, replacing any selected range,
-/// and firing `input` if the value changed. Only text fields and contenteditable take text.
+/// and firing `input` if the value changed. Only editable text fields and contenteditable take text.
 fn insert_text_js(el: &str, text_js: &str) -> String {
-    let text_field = is_text_field_js(el);
+    let text_field = is_editable_text_field_js(el);
     format!(
         r"var insertedText = {text_js};
                 if ({text_field}) {{
@@ -397,6 +415,7 @@ fn insert_text_js(el: &str, text_js: &str) -> String {
                     if ({el}.value !== currentValue) {{
                         {el}.dispatchEvent(new InputEvent('input', {{
                             bubbles: true,
+                            composed: true,
                             cancelable: true,
                             inputType: 'insertText',
                             data: insertedText
@@ -530,6 +549,17 @@ pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
     steps
 }
 
+/// The text a plan types, without its key presses: what a non-typeable form control's value is set to.
+pub fn typed_text(steps: &[SendKeysStep]) -> String {
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            SendKeysStep::Text(run) => Some(run.as_str()),
+            SendKeysStep::Key { .. } => None,
+        })
+        .collect()
+}
+
 /// The key-ups for the modifiers still held after the first `done` steps, so a request that fails
 /// part-way doesn't leave them pressed.
 pub fn modifier_releases(steps: &[SendKeysStep], done: usize) -> Vec<SendKeysStep> {
@@ -608,6 +638,35 @@ pub fn build_send_keys_focus_script(js_var: &str) -> String {
                     }} catch (e) {{}}
                 }}
                 return {text_field} ? el.value : null;
+            }})()"
+    )
+}
+
+/// JS that sets a non-typeable form control's value to `text` and fires `input` and `change` if it
+/// changed. Returns `"set"`, `"immutable"` (read-only or disabled), or `"none"` for other elements.
+pub fn build_set_control_value_script(js_var: &str, text: &str) -> String {
+    let value_control = is_value_control_js("el");
+    let text = js_string(text);
+    format!(
+        r"(function() {{
+                var el = window.{js_var};
+                if (!el || !el.isConnected) {{
+                    throw new Error('stale element reference');
+                }}
+                if (!{value_control}) {{
+                    return 'none';
+                }}
+                if (el.readOnly || el.disabled) {{
+                    return 'immutable';
+                }}
+                el.focus();
+                var previousValue = el.value;
+                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(el, {text});
+                if (el.value !== previousValue) {{
+                    el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+                return 'set';
             }})()"
     )
 }
@@ -933,7 +992,8 @@ mod tests {
             "['text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf(el.type)"
         ));
         let script = build_insert_run_script("__wd_el_abc", "x");
-        assert!(script.contains(&format!("if ({field})")));
+        assert!(script.contains(&format!("if ({})", is_editable_text_field_js("el"))));
+        assert!(is_editable_text_field_js("el").contains(&field));
         assert!(!script.contains("el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'"));
     }
 
@@ -1039,7 +1099,7 @@ mod tests {
     fn delete_keys_only_edit_text_fields_with_a_selection_api() {
         let none = mods(false, false, false, false);
         let backspace = build_special_key_script("Backspace", "Backspace", 8, true, &none);
-        assert!(backspace.contains(&format!("if ({})", is_text_field_js("activeEl"))));
+        assert!(backspace.contains(&format!("if ({})", is_editable_text_field_js("activeEl"))));
         assert!(backspace.contains("typeof selStart === 'number'"));
         assert!(backspace.contains("deleteContentBackward"));
         let delete = build_special_key_script("Delete", "Delete", 46, true, &none);
@@ -1310,5 +1370,71 @@ mod tests {
         assert!(script.contains(&format!("el.value !== {}", js_string("it's\n"))));
         assert!(script.contains("new Event('change'"));
         assert!(!script.contains("throw"));
+    }
+
+    #[test]
+    fn key_and_input_events_cross_shadow_boundaries() {
+        let none = mods(false, false, false, false);
+        for script in [
+            build_special_key_script("Backspace", "Backspace", 8, true, &none),
+            build_printable_key_script(" ", "Space", 32, true, &none),
+        ] {
+            let keyboard = script.find("new KeyboardEvent(").unwrap();
+            let input = script.find("new InputEvent('input'").unwrap();
+            assert!(script[keyboard..].contains("composed: true"));
+            assert!(script[input..].contains("composed: true"));
+            assert_eq!(script.matches("composed: true").count(), 2, "{script}");
+        }
+        assert!(build_special_key_script("End", "End", 35, false, &none).contains("composed: true"));
+    }
+
+    #[test]
+    fn typing_skips_read_only_and_disabled_fields() {
+        let none = mods(false, false, false, false);
+        let editable = is_editable_text_field_js("activeEl");
+        assert!(editable.contains("!activeEl.readOnly && !activeEl.disabled"));
+        for script in [
+            build_printable_key_script("x", "KeyX", 120, true, &none),
+            build_special_key_script("Enter", "Enter", 13, true, &none),
+            build_special_key_script("Backspace", "Backspace", 8, true, &none),
+            build_special_key_script("Delete", "Delete", 46, true, &none),
+        ] {
+            assert!(script.contains(&format!("if ({editable})")), "{script}");
+        }
+        assert!(build_insert_run_script("v", "x")
+            .contains(&format!("if ({})", is_editable_text_field_js("el"))));
+    }
+
+    #[test]
+    fn value_controls_get_their_value_set_directly() {
+        let control = is_value_control_js("el");
+        for kind in [
+            "color",
+            "date",
+            "datetime-local",
+            "month",
+            "range",
+            "time",
+            "week",
+        ] {
+            assert!(control.contains(&format!("'{kind}'")));
+        }
+        for typeable in ["text", "checkbox", "radio", "file", "button"] {
+            assert!(!control.contains(&format!("'{typeable}'")));
+        }
+        let script = build_set_control_value_script("__wd_el_abc", "2026-10-21");
+        assert!(script.contains(&format!("if (!{control})")));
+        assert!(script.contains("return 'immutable';"));
+        assert!(script.contains(&format!("set.call(el, {})", js_string("2026-10-21"))));
+        let input = script.find("new Event('input'").unwrap();
+        let change = script.find("new Event('change'").unwrap();
+        assert!(script.contains("if (el.value !== previousValue)") && input < change);
+    }
+
+    #[test]
+    fn typed_text_keeps_only_the_text_runs() {
+        let steps = plan_send_keys(&format!("20{BACKSPACE}26-10{SHIFT}-21"));
+        assert_eq!(typed_text(&steps), "2026-10-21");
+        assert_eq!(typed_text(&plan_send_keys(NULL_KEY)), "");
     }
 }

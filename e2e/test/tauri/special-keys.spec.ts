@@ -329,4 +329,73 @@ describe('special keys (embedded)', () => {
     await browser.keys(Key.ArrowDown);
     expect(await browser.$('#fresh-radio-2').isSelected()).toBe(true);
   });
+
+  it('should let handlers outside a shadow root see its key and input events', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<div id="fresh-outer-host"></div>';
+      var host = document.querySelector("#fresh-outer-host");
+      host.attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input">';
+      window.__hostEvents = [];
+      for (var type of ["keydown", "input"]) {
+        host.addEventListener(type, function (ev) {
+          window.__hostEvents.push(ev.type);
+        });
+      }`,
+    );
+    const input = browser.$('#fresh-outer-host').shadow$('#shadow-input');
+    await input.click();
+    await browser.keys('x');
+    expect(await input.getValue()).toBe('x');
+    expect(await browser.execute('return window.__hostEvents')).toEqual(['keydown', 'input']);
+  });
+
+  it('should set the value of a date input directly', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<input type="date" id="fresh-date"><input type="date" id="fresh-readonly-date" readonly>';
+      window.__dateEvents = [];
+      for (var type of ["input", "change"]) {
+        document.querySelector("#fresh-date").addEventListener(type, function (ev) {
+          window.__dateEvents.push(ev.type + " " + ev.target.value);
+        });
+      }`,
+    );
+    const date = browser.$('#fresh-date');
+    await date.addValue('2026-10-21');
+    expect(await date.getValue()).toBe('2026-10-21');
+    expect(await browser.execute('return window.__dateEvents')).toEqual(['input 2026-10-21', 'change 2026-10-21']);
+    await date.setValue('2027-01-02');
+    expect(await date.getValue()).toBe('2027-01-02');
+    expect((await errorOf(browser.$('#fresh-readonly-date').addValue('2026-10-21')))?.message).toMatch(/interactable/);
+  });
+
+  it('should keep the selection a focus handler makes when a click focuses a field', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<input id="fresh-select-on-focus" value="old">';
+      document.querySelector("#fresh-select-on-focus").addEventListener("focus", function (ev) {
+        ev.target.select();
+      });`,
+    );
+    await browser.$('#fresh-select-on-focus').click();
+    await browser.keys('x');
+    expect(await browser.$('#fresh-select-on-focus').getValue()).toBe('x');
+  });
+
+  it('should send key events but leave the value of read-only fields alone', async () => {
+    await fillScratch(
+      `scratch.innerHTML = '<textarea id="fresh-readonly-area" readonly>old</textarea><input id="fresh-readonly-input" value="old" readonly>';
+      window.__readonlyKeys = [];
+      document.querySelector("#fresh-readonly-area").addEventListener("keydown", function (ev) {
+        window.__readonlyKeys.push(ev.key);
+      });`,
+    );
+    const area = browser.$('#fresh-readonly-area');
+    await area.addValue(`a${Key.Enter}${Key.Backspace}`);
+    expect(await area.getValue()).toBe('old');
+    expect(await browser.execute('return window.__readonlyKeys')).toEqual(['Enter', 'Backspace']);
+
+    const input = browser.$('#fresh-readonly-input');
+    await input.click();
+    await browser.keys(['x', Key.Space, Key.Backspace]);
+    expect(await input.getValue()).toBe('old');
+  });
 });
