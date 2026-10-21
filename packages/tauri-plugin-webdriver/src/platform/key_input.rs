@@ -179,7 +179,9 @@ pub fn build_special_key_script(
         "Backspace" | "Delete" => delete_js(js_key == "Backspace"),
         "ArrowDown" | "ArrowRight" => radio_step_js(true),
         "ArrowUp" | "ArrowLeft" => radio_step_js(false),
-        "Enter" => line_break_js(modifiers.shift),
+        "Enter" if !(modifiers.ctrl || modifiers.meta || modifiers.alt) => {
+            line_break_js(modifiers.shift)
+        }
         _ => String::new(),
     };
     key_event_script(
@@ -609,8 +611,8 @@ fn release_held_modifiers(steps: &mut Vec<SendKeysStep>, held: &mut HeldModifier
     }
 }
 
-/// JS focusing the stored element (caret at the end only if it wasn't focused) and returning its
-/// value, or `null` unless it's a text field. Throws if the element is stale.
+/// JS focusing the stored element once for send keys (caret at the end only if it wasn't focused),
+/// returning `{ focused, value }`; `value` is `null` unless it's a text field. Throws if stale.
 pub fn build_send_keys_focus_script(js_var: &str) -> String {
     let active_element = deep_active_element_js("activeEl");
     let text_field = is_text_field_js("el");
@@ -637,13 +639,19 @@ pub fn build_send_keys_focus_script(js_var: &str) -> String {
                         }}
                     }} catch (e) {{}}
                 }}
-                return {text_field} ? el.value : null;
+                {active_element}
+                // The body and focus-delegating hosts count as focused when focus is on or inside them.
+                var focused = el === document.body || el === document.documentElement;
+                for (var node = activeEl; node && !focused; node = node.parentNode || node.host) {{
+                    focused = node === el;
+                }}
+                return {{ focused: focused, value: {text_field} ? el.value : null }};
             }})()"
     )
 }
 
-/// JS that sets a non-typeable form control's value to `text` and fires `input` and `change` if it
-/// changed. Returns `"set"`, `"immutable"` (read-only or disabled), or `"none"` for other elements.
+/// JS that sets a non-typeable form control's value to non-empty `text`, firing `input` and
+/// `change` if it changed. Returns `"set"`, `"immutable"`, `"invalid"`, `"file"` or `"none"`.
 pub fn build_set_control_value_script(js_var: &str, text: &str) -> String {
     let value_control = is_value_control_js("el");
     let text = js_string(text);
@@ -653,15 +661,24 @@ pub fn build_set_control_value_script(js_var: &str, text: &str) -> String {
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
-                if (!{value_control}) {{
+                if (el.tagName === 'INPUT' && el.type === 'file') {{
+                    return 'file';
+                }}
+                var text = {text};
+                if (!{value_control} || text === '') {{
                     return 'none';
                 }}
                 if (el.readOnly || el.disabled) {{
                     return 'immutable';
                 }}
                 el.focus();
+                var setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                 var previousValue = el.value;
-                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(el, {text});
+                setValue.call(el, text);
+                if (el.value === '') {{
+                    setValue.call(el, previousValue);
+                    return 'invalid';
+                }}
                 if (el.value !== previousValue) {{
                     el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -671,34 +688,14 @@ pub fn build_set_control_value_script(js_var: &str, text: &str) -> String {
     )
 }
 
-/// JS that refocuses the stored element before a key and returns whether it is now the focused
-/// element; keys must not land on whatever else has focus.
-pub fn build_refocus_script(js_var: &str) -> String {
+/// JS inserting a printable run at the focused element's selection, as typing does, so text follows
+/// focus when a key moves it.
+pub fn build_insert_run_script(run: &str) -> String {
     let active_element = deep_active_element_js("activeEl");
+    let insert_text = insert_text_js("activeEl", &js_string(run));
     format!(
         r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    return false;
-                }}
-                el.focus();
                 {active_element}
-                return activeEl === el;
-            }})()"
-    )
-}
-
-/// JS inserting a printable run into the stored element at its selection; it skips a detached
-/// element rather than throw, since earlier keystrokes already committed.
-pub fn build_insert_run_script(js_var: &str, run: &str) -> String {
-    let insert_text = insert_text_js("el", &js_string(run));
-    format!(
-        r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    return true;
-                }}
-                el.focus();
                 {insert_text}
                 return true;
             }})()"
@@ -971,16 +968,13 @@ mod tests {
         let none = mods(false, false, false, false);
         for script in [
             build_printable_key_script("5", "Numpad5", 101, true, &none),
-            build_insert_run_script("__wd_el_abc", "new"),
+            build_insert_run_script("new"),
         ] {
             assert!(script.contains(
                 "currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)"
             ));
             assert!(script.contains("setSelectionRange(caret, caret)"));
-            assert!(
-                script.contains("if (activeEl.value !== currentValue)")
-                    || script.contains("if (el.value !== currentValue)")
-            );
+            assert!(script.contains("if (activeEl.value !== currentValue)"));
         }
     }
 
@@ -991,8 +985,8 @@ mod tests {
         assert!(field.contains(
             "['text', 'search', 'url', 'tel', 'email', 'password', 'number'].indexOf(el.type)"
         ));
-        let script = build_insert_run_script("__wd_el_abc", "x");
-        assert!(script.contains(&format!("if ({})", is_editable_text_field_js("el"))));
+        let script = build_insert_run_script("x");
+        assert!(script.contains(&format!("if ({})", is_editable_text_field_js("activeEl"))));
         assert!(is_editable_text_field_js("el").contains(&field));
         assert!(!script.contains("el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'"));
     }
@@ -1014,7 +1008,7 @@ mod tests {
         let newline = build_regular_key_script("\n", "\n", true, &none);
         assert!(newline.contains(&format!("key: {}", js_string("\n"))));
         assert!(newline.contains(&format!("var insertedText = {}", js_string("\n"))));
-        let run = build_insert_run_script("v", "a`$\\b\n'");
+        let run = build_insert_run_script("a`$\\b\n'");
         assert!(run.contains(&format!("var insertedText = {}", js_string("a`$\\b\n'"))));
     }
 
@@ -1024,7 +1018,7 @@ mod tests {
         for script in [
             build_special_key_script("Enter", "Enter", 13, true, &none),
             build_printable_key_script(" ", "Space", 32, true, &none),
-            build_refocus_script("v"),
+            build_insert_run_script("x"),
             build_send_keys_focus_script("v"),
         ] {
             assert!(
@@ -1093,6 +1087,14 @@ mod tests {
         assert!(shift_enter.contains("document.execCommand('insertLineBreak', false, null)"));
         let enter_up = build_special_key_script("Enter", "Enter", 13, false, &none);
         assert!(!enter_up.contains("insertedText"));
+        for chord in [
+            mods(true, false, false, false),
+            mods(false, false, true, false),
+            mods(false, false, false, true),
+        ] {
+            let script = build_special_key_script("Enter", "Enter", 13, true, &chord);
+            assert!(!script.contains("insertedText") && !script.contains("insertParagraph"));
+        }
     }
 
     #[test]
@@ -1341,23 +1343,23 @@ mod tests {
         let editor_caret = script.find("range.collapse(false)").unwrap();
         assert!(unfocused < caret && unfocused < editor_caret);
         assert!(script.contains(&format!(
-            "return {} ? el.value : null;",
+            "return {{ focused: focused, value: {} ? el.value : null }};",
             is_text_field_js("el")
         )));
     }
 
     #[test]
-    fn build_refocus_script_reports_whether_the_element_took_focus() {
-        let script = build_refocus_script("__wd_el_abc");
-        assert!(script.contains("el.focus()"));
-        assert!(script.contains("return activeEl === el;"));
-        assert!(script.contains("return false;"));
+    fn build_send_keys_focus_script_accepts_the_body_and_focus_inside_the_element() {
+        let script = build_send_keys_focus_script("__wd_el_abc");
+        assert!(script
+            .contains("var focused = el === document.body || el === document.documentElement;"));
+        assert!(script.contains("node = node.parentNode || node.host"));
     }
 
     #[test]
     fn build_insert_run_script_inserts_fires_input_and_defers_change() {
-        let script = build_insert_run_script("__wd_el_abc", "hi");
-        assert!(script.contains("window.__wd_el_abc"));
+        let script = build_insert_run_script("hi");
+        assert!(script.contains("var activeEl = document.activeElement || document.body;"));
         assert!(script.contains("var insertedText = \"hi\""));
         assert!(script.contains("inputType: 'insertText'"));
         assert!(script.contains("document.execCommand('insertText', false, insertedText)"));
@@ -1401,8 +1403,8 @@ mod tests {
         ] {
             assert!(script.contains(&format!("if ({editable})")), "{script}");
         }
-        assert!(build_insert_run_script("v", "x")
-            .contains(&format!("if ({})", is_editable_text_field_js("el"))));
+        assert!(build_insert_run_script("x")
+            .contains(&format!("if ({})", is_editable_text_field_js("activeEl"))));
     }
 
     #[test]
@@ -1423,12 +1425,22 @@ mod tests {
             assert!(!control.contains(&format!("'{typeable}'")));
         }
         let script = build_set_control_value_script("__wd_el_abc", "2026-10-21");
-        assert!(script.contains(&format!("if (!{control})")));
+        assert!(script.contains(&format!("var text = {};", js_string("2026-10-21"))));
+        assert!(script.contains(&format!("if (!{control} || text === '')")));
         assert!(script.contains("return 'immutable';"));
-        assert!(script.contains(&format!("set.call(el, {})", js_string("2026-10-21"))));
         let input = script.find("new Event('input'").unwrap();
         let change = script.find("new Event('change'").unwrap();
         assert!(script.contains("if (el.value !== previousValue)") && input < change);
+    }
+
+    #[test]
+    fn set_control_value_refuses_file_inputs_and_invalid_values() {
+        let script = build_set_control_value_script("__wd_el_abc", "not-a-date");
+        let file = script.find("el.type === 'file'").unwrap();
+        assert!(file < script.find("return 'none';").unwrap());
+        let invalid = script.find("if (el.value === '') {").unwrap();
+        let restore = script.find("setValue.call(el, previousValue);").unwrap();
+        assert!(invalid < restore && restore < script.find("return 'invalid';").unwrap());
     }
 
     #[test]

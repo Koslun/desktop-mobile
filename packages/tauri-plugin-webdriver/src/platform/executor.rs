@@ -799,6 +799,9 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
+                if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (el.disabled || el.readOnly)) {{
+                    return 'not editable';
+                }}
                 el.focus();
                 if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -820,7 +823,11 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 return true;
             }})()"
         );
-        self.evaluate_js(&script).await?;
+        if extract_value(&self.evaluate_js(&script).await?)?.as_str() == Some("not editable") {
+            return Err(WebDriverErrorResponse::invalid_element_state(
+                "element is disabled or read-only, so it cannot be cleared",
+            ));
+        }
         Ok(())
     }
 
@@ -842,38 +849,37 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                     "form control is read-only or disabled, so its value cannot be set",
                 ))
             }
+            "invalid" => {
+                return Err(WebDriverErrorResponse::invalid_argument(
+                    "text is not a valid value for this form control",
+                ))
+            }
+            "file" => {
+                return Err(WebDriverErrorResponse::invalid_argument(
+                    "sending keys to a file input (file upload) is not supported",
+                ))
+            }
             _ => {}
         }
 
         let focus_script = key_input::build_send_keys_focus_script(js_var);
-        let initial_value = extract_value(&self.evaluate_js(&focus_script).await?)?;
-        let refocus_script = key_input::build_refocus_script(js_var);
+        let focus = extract_value(&self.evaluate_js(&focus_script).await?)?;
+        if focus.get("focused").and_then(Value::as_bool) != Some(true) {
+            return Err(WebDriverErrorResponse::element_not_interactable(
+                "element did not take keyboard focus, so keys cannot be sent to it",
+            ));
+        }
         for (done, step) in steps.iter().enumerate() {
             let outcome = match step {
                 SendKeysStep::Text(run) => self
-                    .evaluate_js(&key_input::build_insert_run_script(js_var, run))
+                    .evaluate_js(&key_input::build_insert_run_script(run))
                     .await
                     .map(|_| ()),
                 SendKeysStep::Key {
                     value,
                     is_down,
                     modifiers,
-                } => {
-                    let focused = if *is_down {
-                        self.evaluate_js(&refocus_script)
-                            .await
-                            .and_then(|result| extract_bool_value(&result))
-                    } else {
-                        Ok(true)
-                    };
-                    match focused {
-                        Ok(true) => self.dispatch_key_event(value, *is_down, modifiers).await,
-                        Ok(false) => Err(WebDriverErrorResponse::element_not_interactable(
-                            "element did not take keyboard focus, so the key cannot be sent to it",
-                        )),
-                        Err(error) => Err(error),
-                    }
-                }
+                } => self.dispatch_key_event(value, *is_down, modifiers).await,
             };
             if let Err(error) = outcome {
                 for release in key_input::modifier_releases(&steps, done) {
@@ -889,7 +895,7 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 return Err(error);
             }
         }
-        if let Some(initial_value) = initial_value.as_str() {
+        if let Some(initial_value) = focus.get("value").and_then(Value::as_str) {
             let change_script = key_input::build_send_keys_change_script(js_var, initial_value);
             self.evaluate_js(&change_script).await?;
         }

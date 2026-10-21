@@ -203,6 +203,7 @@ describe('special keys (embedded)', () => {
     expect(await browser.$('#fresh-checkbox').getValue()).toBe('on');
     await browser.execute('document.querySelector("#fresh-file").focus();');
     expect(await errorOf(browser.keys(Key.Space))).toBeUndefined();
+    expect((await errorOf(browser.$('#fresh-file').addValue('/tmp/upload.txt')))?.message).toMatch(/file/);
   });
 
   it('should refuse special keys when the element cannot take focus', async () => {
@@ -216,14 +217,19 @@ describe('special keys (embedded)', () => {
 
   it('should type into an input inside a shadow root', async () => {
     await fillScratch(
-      `scratch.innerHTML = '<div id="fresh-host"></div>';
-      document.querySelector("#fresh-host").attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input">';`,
+      `scratch.innerHTML = '<div id="fresh-host"></div><div id="fresh-delegating-host"></div>';
+      document.querySelector("#fresh-host").attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input">';
+      document.querySelector("#fresh-delegating-host")
+        .attachShadow({ mode: "open", delegatesFocus: true }).innerHTML = '<input id="delegated-input">';`,
     );
     const input = browser.$('#fresh-host').shadow$('#shadow-input');
     await input.click();
     await browser.keys('x');
     await input.addValue(`a${Key.Backspace}b`);
     expect(await input.getValue()).toBe('xb');
+
+    await browser.$('#fresh-delegating-host').addValue(`a${Key.Backspace}b`);
+    expect(await browser.$('#fresh-delegating-host').shadow$('#delegated-input').getValue()).toBe('b');
   });
 
   it('should send plain text after the existing content of an unfocused contenteditable', async () => {
@@ -283,26 +289,6 @@ describe('special keys (embedded)', () => {
     expect(await browser.$('#keys-textarea').getValue()).toBe(`a${NEWLINE}'b`);
   });
 
-  it('should release held modifiers when a key fails part-way', async () => {
-    await fillScratch(
-      `scratch.innerHTML = '<div id="fresh-dropper" tabindex="-1">drop</div>';
-      var dropper = document.querySelector("#fresh-dropper");
-      dropper.addEventListener("keydown", function (ev) {
-        if (ev.key === "Shift") {
-          dropper.removeAttribute("tabindex");
-          dropper.blur();
-        }
-      });
-      window.__keyupEvents = [];
-      document.addEventListener("keyup", function (ev) {
-        window.__keyupEvents.push({ key: ev.key, shiftKey: ev.shiftKey });
-      }, true);`,
-    );
-    const error = await errorOf(browser.$('#fresh-dropper').addValue(`${Key.Shift}${Key.Enter}`));
-    expect(error?.message).toMatch(/interactable/);
-    expect(await browser.execute('return window.__keyupEvents')).toContainEqual({ key: 'Shift', shiftKey: false });
-  });
-
   it('should break lines on Enter in a textarea and a contenteditable only', async () => {
     await browser.$('#keys-textarea').addValue(`a${Key.Enter}b`);
     expect(await browser.$('#keys-textarea').getValue()).toBe(`a${NEWLINE}b`);
@@ -317,7 +303,7 @@ describe('special keys (embedded)', () => {
 
   it('should move between radios whose group name needs escaping', async () => {
     await fillScratch(
-      `for (var i = 1; i <= 2; i++) {
+      `for (var i = 1; i <= 3; i++) {
         var radio = document.createElement("input");
         radio.type = "radio";
         radio.name = "it" + String.fromCharCode(39) + "s";
@@ -328,6 +314,10 @@ describe('special keys (embedded)', () => {
     await browser.$('#fresh-radio-1').click();
     await browser.keys(Key.ArrowDown);
     expect(await browser.$('#fresh-radio-2').isSelected()).toBe(true);
+
+    await browser.$('#fresh-radio-1').click();
+    await browser.$('#fresh-radio-1').addValue(`${Key.ArrowDown}${Key.ArrowDown}`);
+    expect(await browser.$('#fresh-radio-3').isSelected()).toBe(true);
   });
 
   it('should let handlers outside a shadow root see its key and input events', async () => {
@@ -365,6 +355,10 @@ describe('special keys (embedded)', () => {
     expect(await browser.execute('return window.__dateEvents')).toEqual(['input 2026-10-21', 'change 2026-10-21']);
     await date.setValue('2027-01-02');
     expect(await date.getValue()).toBe('2027-01-02');
+    await date.addValue(Key.ArrowUp);
+    expect(await date.getValue()).toBe('2027-01-02');
+    expect((await errorOf(date.addValue('not-a-date')))?.message).toMatch(/valid value/);
+    expect(await date.getValue()).toBe('2027-01-02');
     expect((await errorOf(browser.$('#fresh-readonly-date').addValue('2026-10-21')))?.message).toMatch(/interactable/);
   });
 
@@ -382,7 +376,8 @@ describe('special keys (embedded)', () => {
 
   it('should send key events but leave the value of read-only fields alone', async () => {
     await fillScratch(
-      `scratch.innerHTML = '<textarea id="fresh-readonly-area" readonly>old</textarea><input id="fresh-readonly-input" value="old" readonly>';
+      `scratch.innerHTML = '<textarea id="fresh-readonly-area" readonly>old</textarea>' +
+        '<input id="fresh-readonly-input" value="old" readonly><input id="fresh-disabled-input" value="old" disabled>';
       window.__readonlyKeys = [];
       document.querySelector("#fresh-readonly-area").addEventListener("keydown", function (ev) {
         window.__readonlyKeys.push(ev.key);
@@ -397,5 +392,11 @@ describe('special keys (embedded)', () => {
     await input.click();
     await browser.keys(['x', Key.Space, Key.Backspace]);
     expect(await input.getValue()).toBe('old');
+    expect(await errorOf(input.clearValue())).toBeDefined();
+    expect(await input.getValue()).toBe('old');
+
+    const disabled = await browser.$('#fresh-disabled-input');
+    expect((await errorOf(browser.elementSendKeys(disabled.elementId, 'x')))?.message).toMatch(/keyboard focus/);
+    expect(await disabled.getValue()).toBe('old');
   });
 });

@@ -420,8 +420,10 @@ pub async fn release<R: Runtime + 'static>(
 
     let executor = state.get_executor_for_window(&current_window, timeouts, frame_context)?;
     let mut held_modifiers = HeldModifiers::from_keys(&pressed_keys);
+    let mut pressed_keys = pressed_keys;
+    pressed_keys.sort();
 
-    // Release all pressed keys (keyUp events)
+    // Release all pressed keys (keyUp events), in a fixed order so each keyup's flags are stable
     for key in pressed_keys {
         held_modifiers.release(&key);
         executor
