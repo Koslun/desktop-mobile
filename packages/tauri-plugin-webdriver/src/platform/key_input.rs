@@ -274,7 +274,7 @@ fn key_event_script(
 }
 
 /// JS for Backspace (`backward`) or Delete in an editable text field: removes the selection, or the
-/// character before or after the caret, and fires `input`.
+/// character before or after the caret (the end, without a selection API), and fires `input`.
 fn delete_js(backward: bool) -> String {
     let text_field = is_editable_text_field_js("activeEl");
     let (edge_check, removed_start, removed_end, input_type) = if backward {
@@ -301,32 +301,37 @@ fn delete_js(backward: bool) -> String {
                         selStart = activeEl.selectionStart;
                         selEnd = activeEl.selectionEnd;
                     }} catch (e) {{}}
-                    if (typeof selStart === 'number' && typeof selEnd === 'number') {{
-                        var removeStart = selStart;
-                        var removeEnd = selEnd;
-                        if (selStart === selEnd) {{
-                            removeStart = {edge_check} ? {removed_start} : selStart;
-                            removeEnd = {edge_check} ? {removed_end} : selStart;
-                        }}
-                        if (removeStart !== removeEnd) {{
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                activeEl.tagName === 'INPUT'
-                                    ? window.HTMLInputElement.prototype
-                                    : window.HTMLTextAreaElement.prototype,
-                                'value'
-                            ).set;
-                            nativeInputValueSetter.call(
-                                activeEl,
-                                currentValue.slice(0, removeStart) + currentValue.slice(removeEnd)
-                            );
+                    var hasSelectionApi = typeof selStart === 'number' && typeof selEnd === 'number';
+                    if (!hasSelectionApi) {{
+                        // Inputs without a selection API (email, number) edit at the end, as typing appends.
+                        selStart = selEnd = currentValue.length;
+                    }}
+                    var removeStart = selStart;
+                    var removeEnd = selEnd;
+                    if (selStart === selEnd) {{
+                        removeStart = {edge_check} ? {removed_start} : selStart;
+                        removeEnd = {edge_check} ? {removed_end} : selStart;
+                    }}
+                    if (removeStart !== removeEnd) {{
+                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            activeEl.tagName === 'INPUT'
+                                ? window.HTMLInputElement.prototype
+                                : window.HTMLTextAreaElement.prototype,
+                            'value'
+                        ).set;
+                        nativeInputValueSetter.call(
+                            activeEl,
+                            currentValue.slice(0, removeStart) + currentValue.slice(removeEnd)
+                        );
+                        if (hasSelectionApi) {{
                             activeEl.setSelectionRange(removeStart, removeStart);
-                            activeEl.dispatchEvent(new InputEvent('input', {{
-                                bubbles: true,
-                                composed: true,
-                                cancelable: true,
-                                inputType: '{input_type}'
-                            }}));
                         }}
+                        activeEl.dispatchEvent(new InputEvent('input', {{
+                            bubbles: true,
+                            composed: true,
+                            cancelable: true,
+                            inputType: '{input_type}'
+                        }}));
                     }}
                 }}"
     )
@@ -517,8 +522,8 @@ pub enum SendKeysStep {
     },
 }
 
-/// Send-keys text as ordered steps: modifiers stay held until the null key or the end (W3C), and
-/// text typed under Control, Alt or Meta is pressed key by key as shortcuts.
+/// Send-keys text as ordered steps: a modifier stays held until it's pressed again, the null key or
+/// the end, and text typed under Control, Alt or Meta is pressed key by key as shortcuts.
 pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
     let mut steps = Vec::new();
     let mut held = HeldModifiers::default();
@@ -536,13 +541,15 @@ pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
                 release_held_modifiers(&mut steps, &mut held);
             }
             KeySegment::Special(key) if is_modifier_key(&key) => {
-                if held.press(&key) {
-                    steps.push(SendKeysStep::Key {
-                        value: key,
-                        is_down: true,
-                        modifiers: held.state(),
-                    });
+                let is_down = held.press(&key);
+                if !is_down {
+                    held.release(&key);
                 }
+                steps.push(SendKeysStep::Key {
+                    value: key,
+                    is_down,
+                    modifiers: held.state(),
+                });
             }
             KeySegment::Special(key) => push_key_press(&mut steps, &key, modifiers),
         }
@@ -611,20 +618,76 @@ fn release_held_modifiers(steps: &mut Vec<SendKeysStep>, held: &mut HeldModifier
     }
 }
 
-/// JS focusing the stored element once for send keys (caret at the end only if it wasn't focused),
-/// returning `{ focused, value }`; `value` is `null` unless it's a text field. Throws if stale.
-pub fn build_send_keys_focus_script(js_var: &str) -> String {
+/// The text to type when a plan presses no keys, so the whole request fits in one script.
+pub fn plain_text(steps: &[SendKeysStep]) -> Option<&str> {
+    match steps {
+        [] => Some(""),
+        [SendKeysStep::Text(text)] => Some(text),
+        _ => None,
+    }
+}
+
+/// JS starting send keys: sets a value control's value to `typed`, or focuses the element once and,
+/// for a `plain` request, types it too. Returns `{ status, value }` and never throws.
+pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&str>) -> String {
     let active_element = deep_active_element_js("activeEl");
     let text_field = is_text_field_js("el");
+    let value_control = is_value_control_js("el");
+    let typed = js_string(typed);
+    let finish = match plain {
+        None => "return { status: 'focused', value: initialValue };".to_string(),
+        Some(text) => {
+            let insert_text = if text.is_empty() {
+                String::new()
+            } else {
+                insert_text_js("activeEl", &js_string(text))
+            };
+            format!(
+                r"{insert_text}
+                if (initialValue !== null && el.value !== initialValue) {{
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+                return {{ status: 'done' }};"
+            )
+        }
+    };
     format!(
         r"(function() {{
                 var el = window.{js_var};
                 if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
+                    return {{ status: 'stale' }};
+                }}
+                if (el.tagName === 'INPUT' && el.type === 'file') {{
+                    return {{ status: 'file' }};
+                }}
+                var typed = {typed};
+                if ({value_control} && typed !== '') {{
+                    if (el.readOnly || el.disabled) {{
+                        return {{ status: 'immutable' }};
+                    }}
+                    el.focus();
+                    var setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    var previousValue = el.value;
+                    setValue.call(el, typed);
+                    if (el.value === '') {{
+                        setValue.call(el, previousValue);
+                        return {{ status: 'invalid' }};
+                    }}
+                    if (el.value !== previousValue) {{
+                        el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                    return {{ status: 'set' }};
                 }}
                 {active_element}
                 var wasFocused = activeEl === el;
-                el.focus();
+                // Text inside a contenteditable is focused through its editing host.
+                var focusTarget = el;
+                while (focusTarget.isContentEditable && focusTarget.parentElement
+                    && focusTarget.parentElement.isContentEditable) {{
+                    focusTarget = focusTarget.parentElement;
+                }}
+                focusTarget.focus();
                 if (!wasFocused) {{
                     try {{
                         if ({text_field}) {{
@@ -640,50 +703,16 @@ pub fn build_send_keys_focus_script(js_var: &str) -> String {
                     }} catch (e) {{}}
                 }}
                 {active_element}
-                // The body and focus-delegating hosts count as focused when focus is on or inside them.
-                var focused = el === document.body || el === document.documentElement;
+                // The body, focus-delegating hosts and an editing host holding the element count as focus.
+                var focused = el === document.body || el === document.documentElement || activeEl === focusTarget;
                 for (var node = activeEl; node && !focused; node = node.parentNode || node.host) {{
                     focused = node === el;
                 }}
-                return {{ focused: focused, value: {text_field} ? el.value : null }};
-            }})()"
-    )
-}
-
-/// JS that sets a non-typeable form control's value to non-empty `text`, firing `input` and
-/// `change` if it changed. Returns `"set"`, `"immutable"`, `"invalid"`, `"file"` or `"none"`.
-pub fn build_set_control_value_script(js_var: &str, text: &str) -> String {
-    let value_control = is_value_control_js("el");
-    let text = js_string(text);
-    format!(
-        r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
+                if (!focused) {{
+                    return {{ status: 'unfocused' }};
                 }}
-                if (el.tagName === 'INPUT' && el.type === 'file') {{
-                    return 'file';
-                }}
-                var text = {text};
-                if (!{value_control} || text === '') {{
-                    return 'none';
-                }}
-                if (el.readOnly || el.disabled) {{
-                    return 'immutable';
-                }}
-                el.focus();
-                var setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                var previousValue = el.value;
-                setValue.call(el, text);
-                if (el.value === '') {{
-                    setValue.call(el, previousValue);
-                    return 'invalid';
-                }}
-                if (el.value !== previousValue) {{
-                    el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}
-                return 'set';
+                var initialValue = {text_field} ? el.value : null;
+                {finish}
             }})()"
     )
 }
@@ -1019,7 +1048,7 @@ mod tests {
             build_special_key_script("Enter", "Enter", 13, true, &none),
             build_printable_key_script(" ", "Space", 32, true, &none),
             build_insert_run_script("x"),
-            build_send_keys_focus_script("v"),
+            build_send_keys_start_script("v", "", None),
         ] {
             assert!(
                 script.contains("activeEl.shadowRoot.activeElement"),
@@ -1098,11 +1127,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_keys_only_edit_text_fields_with_a_selection_api() {
+    fn delete_keys_edit_text_fields_at_the_end_without_a_selection_api() {
         let none = mods(false, false, false, false);
         let backspace = build_special_key_script("Backspace", "Backspace", 8, true, &none);
         assert!(backspace.contains(&format!("if ({})", is_editable_text_field_js("activeEl"))));
-        assert!(backspace.contains("typeof selStart === 'number'"));
+        let fallback = backspace.find("if (!hasSelectionApi) {").unwrap();
+        let to_end = backspace
+            .find("selStart = selEnd = currentValue.length;")
+            .unwrap();
+        assert!(fallback < to_end);
         assert!(backspace.contains("deleteContentBackward"));
         let delete = build_special_key_script("Delete", "Delete", 46, true, &none);
         assert!(delete.contains("deleteContentForward"));
@@ -1302,17 +1335,22 @@ mod tests {
     }
 
     #[test]
-    fn plan_send_keys_ignores_a_repeated_modifier_and_releases_in_code_point_order() {
+    fn plan_send_keys_toggles_a_repeated_modifier_and_releases_in_code_point_order() {
         let none = ModifierState::default();
         let alt = mods(false, false, true, false);
+        let shift = mods(false, true, false, false);
         let alt_shift = mods(false, true, true, false);
+        let ctrl = mods(true, false, false, false);
+        let ctrl_shift = mods(true, true, false, false);
         assert_eq!(
-            plan_send_keys(&format!("{ALT}{SHIFT}{ALT}")),
+            plan_send_keys(&format!("{ALT}{SHIFT}{ALT}{CONTROL}")),
             vec![
                 key(ALT, true, alt),
                 key(SHIFT, true, alt_shift),
-                key(SHIFT, false, alt),
-                key(ALT, false, none),
+                key(ALT, false, shift),
+                key(CONTROL, true, ctrl_shift),
+                key(SHIFT, false, ctrl),
+                key(CONTROL, false, none),
             ]
         );
     }
@@ -1332,28 +1370,46 @@ mod tests {
     }
 
     #[test]
-    fn build_send_keys_focus_script_moves_the_caret_only_into_an_unfocused_element() {
-        let script = build_send_keys_focus_script("__wd_el_abc");
-        assert!(script.contains("throw new Error('stale element reference')"));
-        assert!(script.contains("el.focus()"));
+    fn build_send_keys_start_script_moves_the_caret_only_into_an_unfocused_element() {
+        let script = build_send_keys_start_script("__wd_el_abc", "", None);
+        assert!(script.contains("focusTarget.focus()"));
         let unfocused = script.find("if (!wasFocused) {").unwrap();
         let caret = script
             .find("el.setSelectionRange(el.value.length, el.value.length)")
             .unwrap();
         let editor_caret = script.find("range.collapse(false)").unwrap();
         assert!(unfocused < caret && unfocused < editor_caret);
-        assert!(script.contains(&format!(
-            "return {{ focused: focused, value: {} ? el.value : null }};",
-            is_text_field_js("el")
-        )));
+        assert!(script.contains("return { status: 'focused', value: initialValue };"));
     }
 
     #[test]
-    fn build_send_keys_focus_script_accepts_the_body_and_focus_inside_the_element() {
-        let script = build_send_keys_focus_script("__wd_el_abc");
-        assert!(script
-            .contains("var focused = el === document.body || el === document.documentElement;"));
+    fn build_send_keys_start_script_accepts_the_body_editing_hosts_and_focus_inside() {
+        let script = build_send_keys_start_script("__wd_el_abc", "", None);
+        assert!(script.contains(
+            "el === document.body || el === document.documentElement || activeEl === focusTarget;"
+        ));
+        assert!(script.contains("focusTarget = focusTarget.parentElement;"));
         assert!(script.contains("node = node.parentNode || node.host"));
+        assert!(script.contains("return { status: 'unfocused' };"));
+    }
+
+    #[test]
+    fn build_send_keys_start_script_reports_a_stale_element_without_throwing() {
+        let script = build_send_keys_start_script("__wd_el_abc", "x", Some("x"));
+        assert!(script.contains("return { status: 'stale' };"));
+        assert!(!script.contains("throw"));
+    }
+
+    #[test]
+    fn build_send_keys_start_script_types_plain_text_in_the_same_script() {
+        let plain = build_send_keys_start_script("__wd_el_abc", "hi", Some("hi"));
+        let focus = plain.find("focusTarget.focus()").unwrap();
+        let insert = plain.find("var insertedText = \"hi\"").unwrap();
+        let change = plain.rfind("new Event('change'").unwrap();
+        assert!(focus < insert && insert < change);
+        assert!(plain.contains("return { status: 'done' };"));
+        let empty = build_send_keys_start_script("__wd_el_abc", "", Some(""));
+        assert!(!empty.contains("insertedText") && empty.contains("return { status: 'done' };"));
     }
 
     #[test]
@@ -1424,23 +1480,23 @@ mod tests {
         for typeable in ["text", "checkbox", "radio", "file", "button"] {
             assert!(!control.contains(&format!("'{typeable}'")));
         }
-        let script = build_set_control_value_script("__wd_el_abc", "2026-10-21");
-        assert!(script.contains(&format!("var text = {};", js_string("2026-10-21"))));
-        assert!(script.contains(&format!("if (!{control} || text === '')")));
-        assert!(script.contains("return 'immutable';"));
+        let script = build_send_keys_start_script("__wd_el_abc", "2026-10-21", Some("2026-10-21"));
+        assert!(script.contains(&format!("var typed = {};", js_string("2026-10-21"))));
+        assert!(script.contains(&format!("if ({control} && typed !== '')")));
+        assert!(script.contains("return { status: 'immutable' };"));
         let input = script.find("new Event('input'").unwrap();
         let change = script.find("new Event('change'").unwrap();
         assert!(script.contains("if (el.value !== previousValue)") && input < change);
     }
 
     #[test]
-    fn set_control_value_refuses_file_inputs_and_invalid_values() {
-        let script = build_set_control_value_script("__wd_el_abc", "not-a-date");
+    fn send_keys_start_refuses_file_inputs_and_invalid_values() {
+        let script = build_send_keys_start_script("__wd_el_abc", "not-a-date", Some("not-a-date"));
         let file = script.find("el.type === 'file'").unwrap();
-        assert!(file < script.find("return 'none';").unwrap());
+        assert!(file < script.find("var typed").unwrap());
         let invalid = script.find("if (el.value === '') {").unwrap();
         let restore = script.find("setValue.call(el, previousValue);").unwrap();
-        assert!(invalid < restore && restore < script.find("return 'invalid';").unwrap());
+        assert!(invalid < restore && restore < script.find("status: 'invalid'").unwrap());
     }
 
     #[test]

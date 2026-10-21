@@ -1,14 +1,11 @@
-import process from 'node:process';
 import { browser, expect } from '@wdio/globals';
 import { Key } from 'webdriverio';
 import '@wdio/native-types';
 
 /**
  * WebDriver special keys (U+E000–U+E05D) through the embedded provider's own key mapping (#735).
- * The other providers hand keys to their upstream drivers, so this suite runs on embedded only.
+ * The other providers hand keys to their upstream drivers, so wdio.tauri.conf.ts excludes this suite.
  */
-
-const driverProvider = process.env.DRIVER_PROVIDER as 'official' | 'crabnebula' | 'embedded' | 'external' | undefined;
 
 const CONTROL_RIGHT = '\uE051';
 
@@ -53,12 +50,6 @@ async function errorOf(action: Promise<unknown>) {
 }
 
 describe('special keys (embedded)', () => {
-  before(function () {
-    if (driverProvider !== 'embedded') {
-      this.skip();
-    }
-  });
-
   beforeEach(async () => {
     await browser.execute(
       'window.__keyTargetEvents = [];' +
@@ -92,6 +83,11 @@ describe('special keys (embedded)', () => {
     const input = browser.$('#keys-input');
     await input.addValue(`abc${Key.Backspace}d${Key.PageDown}`);
     expect(await input.getValue()).toBe('abd');
+
+    await fillScratch(`scratch.innerHTML = '<input type="email" id="fresh-email">';`);
+    const email = browser.$('#fresh-email');
+    await email.addValue(`ab${Key.Backspace}c`);
+    expect(await email.getValue()).toBe('ac');
   });
 
   it('should type the digit for a numpad key inside addValue', async () => {
@@ -236,6 +232,13 @@ describe('special keys (embedded)', () => {
     await browser.execute('document.querySelector("#keys-editor").textContent = "old";');
     await browser.$('#keys-editor').addValue('new');
     expect(await editorText()).toBe('oldnew');
+
+    await browser.execute(
+      `document.querySelector("#keys-editor").innerHTML = '<p id="keys-editor-line">line</p>';
+      document.activeElement.blur();`,
+    );
+    await browser.$('#keys-editor-line').addValue('s');
+    expect(await editorText()).toBe('lines');
   });
 
   it('should type at the caret of a field that already has focus', async () => {

@@ -840,34 +840,36 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         use crate::platform::key_input::{self, SendKeysStep};
 
         let steps = key_input::plan_send_keys(text);
-        let control_script =
-            key_input::build_set_control_value_script(js_var, &key_input::typed_text(&steps));
-        match extract_string_value(&self.evaluate_js(&control_script).await?)?.as_str() {
-            "set" => return Ok(()),
-            "immutable" => {
+        let start_script = key_input::build_send_keys_start_script(
+            js_var,
+            &key_input::typed_text(&steps),
+            key_input::plain_text(&steps),
+        );
+        let start = extract_value(&self.evaluate_js(&start_script).await?)?;
+        match start.get("status").and_then(Value::as_str) {
+            Some("done" | "set") => return Ok(()),
+            Some("focused") => {}
+            Some("stale") => return Err(WebDriverErrorResponse::stale_element_reference()),
+            Some("immutable") => {
                 return Err(WebDriverErrorResponse::element_not_interactable(
                     "form control is read-only or disabled, so its value cannot be set",
                 ))
             }
-            "invalid" => {
+            Some("invalid") => {
                 return Err(WebDriverErrorResponse::invalid_argument(
                     "text is not a valid value for this form control",
                 ))
             }
-            "file" => {
+            Some("file") => {
                 return Err(WebDriverErrorResponse::invalid_argument(
                     "sending keys to a file input (file upload) is not supported",
                 ))
             }
-            _ => {}
-        }
-
-        let focus_script = key_input::build_send_keys_focus_script(js_var);
-        let focus = extract_value(&self.evaluate_js(&focus_script).await?)?;
-        if focus.get("focused").and_then(Value::as_bool) != Some(true) {
-            return Err(WebDriverErrorResponse::element_not_interactable(
-                "element did not take keyboard focus, so keys cannot be sent to it",
-            ));
+            _ => {
+                return Err(WebDriverErrorResponse::element_not_interactable(
+                    "element did not take keyboard focus, so keys cannot be sent to it",
+                ))
+            }
         }
         for (done, step) in steps.iter().enumerate() {
             let outcome = match step {
@@ -895,7 +897,7 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 return Err(error);
             }
         }
-        if let Some(initial_value) = focus.get("value").and_then(Value::as_str) {
+        if let Some(initial_value) = start.get("value").and_then(Value::as_str) {
             let change_script = key_input::build_send_keys_change_script(js_var, initial_value);
             self.evaluate_js(&change_script).await?;
         }
