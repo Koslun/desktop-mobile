@@ -332,7 +332,7 @@ pub struct PrintOptions {
     pub page_ranges: Option<Vec<String>>,
 }
 
-/// Tracks the state of modifier keys during action sequences
+/// The modifier flags a key event carries; `key_input::HeldModifiers` derives them from the held keys
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ModifierState {
@@ -340,19 +340,6 @@ pub struct ModifierState {
     pub shift: bool,
     pub alt: bool,
     pub meta: bool,
-}
-
-impl ModifierState {
-    /// Update modifier state when a key is pressed or released
-    pub fn update(&mut self, key: &str, is_down: bool) {
-        match key {
-            "\u{E009}" | "\u{E051}" => self.ctrl = is_down, // Control
-            "\u{E008}" | "\u{E050}" => self.shift = is_down, // Shift
-            "\u{E00A}" | "\u{E052}" => self.alt = is_down,  // Alt
-            "\u{E03D}" | "\u{E053}" => self.meta = is_down, // Meta
-            _ => {}
-        }
-    }
 }
 
 /// Platform-agnostic trait for `WebView` operations.
@@ -836,11 +823,8 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         use crate::platform::key_input::SendKeysStep;
 
         let steps = crate::platform::key_input::plan_send_keys(text);
-        if steps
-            .iter()
-            .all(|step| matches!(step, SendKeysStep::Text(_)))
-        {
-            let script = crate::platform::key_input::build_send_keys_script(js_var, text);
+        if let Some(plain) = crate::platform::key_input::plain_text(&steps) {
+            let script = crate::platform::key_input::build_send_keys_script(js_var, plain);
             self.evaluate_js(&script).await?;
             return Ok(());
         }
@@ -851,7 +835,7 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         for step in &steps {
             match step {
                 SendKeysStep::Text(run) => {
-                    let script = crate::platform::key_input::build_append_run_script(js_var, run);
+                    let script = crate::platform::key_input::build_insert_run_script(js_var, run);
                     self.evaluate_js(&script).await?;
                 }
                 SendKeysStep::Key {
@@ -1316,7 +1300,7 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
             }
             Some((js_key, js_code, key_code)) => {
                 let script = crate::platform::key_input::build_special_key_script(
-                    js_key, js_code, key_code, is_down,
+                    js_key, js_code, key_code, is_down, modifiers,
                 );
                 self.evaluate_js(&script).await?;
                 Ok(())

@@ -10,11 +10,28 @@ import '@wdio/native-types';
 
 const driverProvider = process.env.DRIVER_PROVIDER as 'official' | 'crabnebula' | 'embedded' | 'external' | undefined;
 
+const CONTROL_RIGHT = '';
+
 type KeyEvent = {
   key: string;
   code: string;
   keyCode: number;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
 };
+
+const noModifiers = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false };
+
+async function keyTargetEvents() {
+  return (await browser.execute('return window.__keyTargetEvents || []')) as unknown as KeyEvent[];
+}
+
+async function editorText() {
+  const text = (await browser.execute('return document.querySelector("#keys-editor").textContent')) as string;
+  return text.replace(/ /g, ' ');
+}
 
 describe('special keys (embedded)', () => {
   before(function () {
@@ -25,7 +42,9 @@ describe('special keys (embedded)', () => {
 
   beforeEach(async () => {
     await browser.execute(
-      'window.__keyTargetEvents = []; var el = document.querySelector("#keys-input"); if (el) { el.value = ""; }',
+      'window.__keyTargetEvents = [];' +
+        'document.querySelector("#keys-input").value = "";' +
+        'document.querySelector("#keys-editor").textContent = "";',
     );
   });
 
@@ -37,12 +56,11 @@ describe('special keys (embedded)', () => {
       await browser.keys(key);
     }
 
-    const events = (await browser.execute('return window.__keyTargetEvents || []')) as unknown as KeyEvent[];
-    expect(events).toEqual([
-      { key: 'PageDown', code: 'PageDown', keyCode: 34 },
-      { key: 'PageUp', code: 'PageUp', keyCode: 33 },
-      { key: 'Home', code: 'Home', keyCode: 36 },
-      { key: 'End', code: 'End', keyCode: 35 },
+    expect(await keyTargetEvents()).toEqual([
+      { key: 'PageDown', code: 'PageDown', keyCode: 34, ...noModifiers },
+      { key: 'PageUp', code: 'PageUp', keyCode: 33, ...noModifiers },
+      { key: 'Home', code: 'Home', keyCode: 36, ...noModifiers },
+      { key: 'End', code: 'End', keyCode: 35, ...noModifiers },
     ]);
   });
 
@@ -56,5 +74,66 @@ describe('special keys (embedded)', () => {
     const input = browser.$('#keys-input');
     await input.addValue(`1${Key.Numpad2}`);
     expect(await input.getValue()).toBe('12');
+  });
+
+  it('should not type the null key', async () => {
+    const input = browser.$('#keys-input');
+    await input.addValue(`a${Key.NULL}b`);
+    expect(await input.getValue()).toBe('ab');
+    await input.addValue(Key.NULL);
+    expect(await input.getValue()).toBe('ab');
+  });
+
+  it('should replace a selection made with Control+A in an input', async () => {
+    const input = browser.$('#keys-input');
+    await input.setValue('old');
+    await input.addValue(`${Key.Control}a${Key.NULL}new`);
+    expect(await input.getValue()).toBe('new');
+  });
+
+  it('should replace a selection made with Control+A in a contenteditable', async () => {
+    await browser.execute('document.querySelector("#keys-editor").textContent = "old";');
+    await browser.$('#keys-editor').addValue(`${Key.Control}a${Key.NULL}new`);
+    expect(await editorText()).toBe('new');
+  });
+
+  it('should carry held modifiers on special keys', async () => {
+    await browser.$('#key-target').addValue(`${Key.Shift}${Key.Enter}`);
+    expect((await keyTargetEvents()).find((event) => event.key === 'Enter')).toMatchObject({ shiftKey: true });
+
+    await browser.execute('window.__keyTargetEvents = [];');
+    await browser.keys([Key.Shift, Key.PageDown]);
+    expect((await keyTargetEvents()).find((event) => event.key === 'PageDown')).toMatchObject({ shiftKey: true });
+  });
+
+  it('should continue after existing contenteditable content', async () => {
+    await browser.execute('document.querySelector("#keys-editor").textContent = "old";');
+    await browser.$('#keys-editor').addValue(`new${Key.PageDown}`);
+    expect(await editorText()).toBe('oldnew');
+  });
+
+  it('should type printable special keys into a contenteditable', async () => {
+    await browser.$('#keys-editor').addValue(`a${Key.Space}b`);
+    expect(await editorText()).toBe('a b');
+  });
+
+  it('should keep Control held while the other hand still holds it', async () => {
+    const input = browser.$('#keys-input');
+    await input.setValue('old');
+    await input.click();
+    await browser
+      .action('key')
+      .down(Key.Control)
+      .down(CONTROL_RIGHT)
+      .up(CONTROL_RIGHT)
+      .down('a')
+      .up('a')
+      .up(Key.Control)
+      .perform();
+
+    const selection = await browser.execute(
+      'var el = document.querySelector("#keys-input"); return [el.value, el.selectionStart, el.selectionEnd];',
+    );
+    expect(selection).toEqual(['old', 0, 3]);
   });
 });

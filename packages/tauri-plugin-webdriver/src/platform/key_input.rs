@@ -1,5 +1,7 @@
 //! Keyboard input mapping — shared, platform-agnostic building blocks.
 
+use std::collections::BTreeSet;
+
 use super::executor::ModifierState;
 
 /// The WebDriver null key; in Element Send Keys it releases every held modifier.
@@ -129,8 +131,13 @@ pub fn build_special_key_script(
     js_code: &str,
     key_code: u32,
     is_down: bool,
+    modifiers: &ModifierState,
 ) -> String {
     let event_type = if is_down { "keydown" } else { "keyup" };
+    let ctrl_key = modifiers.ctrl;
+    let meta_key = modifiers.meta;
+    let shift_key = modifiers.shift;
+    let alt_key = modifiers.alt;
 
     if is_down && (js_key == "Backspace" || js_key == "Delete") {
         format!(
@@ -142,6 +149,10 @@ pub fn build_special_key_script(
                         code: '{js_code}',
                         keyCode: {key_code},
                         which: {key_code},
+                        ctrlKey: {ctrl_key},
+                        metaKey: {meta_key},
+                        shiftKey: {shift_key},
+                        altKey: {alt_key},
                         bubbles: true,
                         cancelable: true
                     }});
@@ -207,6 +218,10 @@ pub fn build_special_key_script(
                         code: '{js_code}',
                         keyCode: {key_code},
                         which: {key_code},
+                        ctrlKey: {ctrl_key},
+                        metaKey: {meta_key},
+                        shiftKey: {shift_key},
+                        altKey: {alt_key},
                         bubbles: true,
                         cancelable: true
                     }});
@@ -245,6 +260,10 @@ pub fn build_special_key_script(
                         code: '{js_code}',
                         keyCode: {key_code},
                         which: {key_code},
+                        ctrlKey: {ctrl_key},
+                        metaKey: {meta_key},
+                        shiftKey: {shift_key},
+                        altKey: {alt_key},
                         bubbles: true,
                         cancelable: true
                     }});
@@ -289,6 +308,7 @@ pub fn build_printable_key_script(
     let alt_key = modifiers.alt;
 
     let is_select_all = is_down && (ch == 'a' || ch == 'A') && (ctrl_key || meta_key);
+    let insert_text = insert_text_js("activeEl", &format!("'{escaped_key}'"));
 
     if is_select_all {
         format!(
@@ -338,25 +358,7 @@ pub fn build_printable_key_script(
                     activeEl.dispatchEvent(keydownEvent);
 
                     if (!{ctrl_key} && !{meta_key} && !{alt_key}) {{
-                        if (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') {{
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                activeEl.tagName === 'INPUT'
-                                    ? window.HTMLInputElement.prototype
-                                    : window.HTMLTextAreaElement.prototype,
-                                'value'
-                            ).set;
-
-                            var newValue = activeEl.value + '{escaped_key}';
-                            nativeInputValueSetter.call(activeEl, newValue);
-
-                            var inputEvent = new InputEvent('input', {{
-                                bubbles: true,
-                                cancelable: true,
-                                inputType: 'insertText',
-                                data: '{escaped_key}'
-                            }});
-                            activeEl.dispatchEvent(inputEvent);
-                        }}
+                        {insert_text}
                     }}
 
                     return true;
@@ -453,10 +455,49 @@ pub fn segment_send_keys(text: &str) -> Vec<KeySegment> {
     segments
 }
 
+/// The modifier keys held down. Each key is tracked on its own, so releasing right Control leaves
+/// Control set while left Control is still held.
+#[derive(Debug, Clone, Default)]
+pub struct HeldModifiers {
+    keys: BTreeSet<String>,
+}
+
+impl HeldModifiers {
+    /// Record a key press; returns whether it newly held a modifier.
+    pub fn press(&mut self, key: &str) -> bool {
+        is_modifier_key(key) && self.keys.insert(key.to_string())
+    }
+
+    /// Record a key release; returns whether it released a held modifier.
+    pub fn release(&mut self, key: &str) -> bool {
+        self.keys.remove(key)
+    }
+
+    /// The modifier flags for the keys still held.
+    pub fn state(&self) -> ModifierState {
+        let mut state = ModifierState::default();
+        for key in &self.keys {
+            match map_special_key(key) {
+                Some(("Control", _, _)) => state.ctrl = true,
+                Some(("Shift", _, _)) => state.shift = true,
+                Some(("Alt", _, _)) => state.alt = true,
+                Some(("Meta", _, _)) => state.meta = true,
+                _ => {}
+            }
+        }
+        state
+    }
+
+    /// The held modifier keys in code-point order.
+    pub fn keys(&self) -> Vec<String> {
+        self.keys.iter().cloned().collect()
+    }
+}
+
 /// One step of an element send-keys request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendKeysStep {
-    /// Printable text appended to the element.
+    /// Printable text inserted into the element.
     Text(String),
     /// A key event for the focused element, dispatched as the actions path dispatches it.
     Key {
@@ -471,36 +512,51 @@ pub enum SendKeysStep {
 /// key as shortcuts instead of being typed; Shift alone doesn't change the typed text.
 pub fn plan_send_keys(text: &str) -> Vec<SendKeysStep> {
     let mut steps = Vec::new();
-    let mut modifiers = ModifierState::default();
-    let mut held: Vec<String> = Vec::new();
+    let mut held = HeldModifiers::default();
 
     for segment in segment_send_keys(text) {
+        let modifiers = held.state();
         match segment {
             KeySegment::Text(run) if modifiers.ctrl || modifiers.alt || modifiers.meta => {
                 for ch in run.chars() {
                     push_key_press(&mut steps, &ch.to_string(), modifiers);
                 }
             }
-            KeySegment::Text(run) => steps.push(SendKeysStep::Text(run)),
+            KeySegment::Text(run) => push_text(&mut steps, &run),
             KeySegment::Special(key) if key == NULL_KEY => {
-                release_held_modifiers(&mut steps, &mut held, &mut modifiers);
+                release_held_modifiers(&mut steps, &mut held);
             }
             KeySegment::Special(key) if is_modifier_key(&key) => {
-                if !held.contains(&key) {
-                    modifiers.update(&key, true);
+                if held.press(&key) {
                     steps.push(SendKeysStep::Key {
-                        value: key.clone(),
+                        value: key,
                         is_down: true,
-                        modifiers,
+                        modifiers: held.state(),
                     });
-                    held.push(key);
                 }
             }
             KeySegment::Special(key) => push_key_press(&mut steps, &key, modifiers),
         }
     }
-    release_held_modifiers(&mut steps, &mut held, &mut modifiers);
+    release_held_modifiers(&mut steps, &mut held);
     steps
+}
+
+/// The text to type when a plan presses no keys, so it can go in one step.
+pub fn plain_text(steps: &[SendKeysStep]) -> Option<&str> {
+    match steps {
+        [] => Some(""),
+        [SendKeysStep::Text(text)] => Some(text),
+        _ => None,
+    }
+}
+
+fn push_text(steps: &mut Vec<SendKeysStep>, run: &str) {
+    if let Some(SendKeysStep::Text(last)) = steps.last_mut() {
+        last.push_str(run);
+    } else {
+        steps.push(SendKeysStep::Text(run.to_string()));
+    }
 }
 
 fn push_key_press(steps: &mut Vec<SendKeysStep>, value: &str, modifiers: ModifierState) {
@@ -514,25 +570,21 @@ fn push_key_press(steps: &mut Vec<SendKeysStep>, value: &str, modifiers: Modifie
 }
 
 /// Key-up every held modifier in code-point order, as the spec's "clear the modifier key state"
-/// releases them.
-fn release_held_modifiers(
-    steps: &mut Vec<SendKeysStep>,
-    held: &mut Vec<String>,
-    modifiers: &mut ModifierState,
-) {
-    held.sort();
-    for key in held.drain(..) {
+/// releases them. Each key-up carries the flags left after its own release.
+fn release_held_modifiers(steps: &mut Vec<SendKeysStep>, held: &mut HeldModifiers) {
+    for key in held.keys() {
+        held.release(&key);
         steps.push(SendKeysStep::Key {
-            value: key.clone(),
+            value: key,
             is_down: false,
-            modifiers: *modifiers,
+            modifiers: held.state(),
         });
-        modifiers.update(&key, false);
     }
 }
 
-/// JS that focuses the stored element and moves the caret to the end, so special keys act after
-/// the existing value. Throws if the element is stale; runs before any keystroke commits.
+/// JS that focuses the stored element and puts the caret at the end, so typing continues after the
+/// existing content. A contenteditable that already had focus keeps its caret. Throws if the
+/// element is stale; runs before any keystroke commits.
 pub fn build_send_keys_focus_script(js_var: &str) -> String {
     format!(
         r"(function() {{
@@ -540,11 +592,19 @@ pub fn build_send_keys_focus_script(js_var: &str) -> String {
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
+                var wasFocused = document.activeElement === el;
                 el.focus();
                 try {{
                     if (typeof el.setSelectionRange === 'function') {{
                         var end = (el.value || '').length;
                         el.setSelectionRange(end, end);
+                    }} else if (el.isContentEditable && !wasFocused) {{
+                        var range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        var selection = window.getSelection();
+                        selection.removeAllRanges();
+                        selection.addRange(range);
                     }}
                 }} catch (e) {{}}
                 return true;
@@ -566,16 +626,16 @@ pub fn build_refocus_script(js_var: &str) -> String {
     )
 }
 
-/// JS that appends a printable run to the stored element, fires `input`, and moves the caret to the
-/// end (so a following special key acts after the run). Best-effort: it skips silently when the
-/// element is gone — earlier keystrokes in the same request already committed, so throwing here
-/// would misreport a partial success — and fires no `change`; the caller dispatches that once after
-/// the whole sequence.
-pub fn build_append_run_script(js_var: &str, run: &str) -> String {
+/// JS that inserts a printable run into the stored element at its selection, replacing any selected
+/// range, and fires `input`. Best-effort: it skips silently when the element is gone — earlier
+/// keystrokes in the same request already committed, so throwing here would misreport a partial
+/// success — and fires no `change`; the caller dispatches that once after the whole sequence.
+pub fn build_insert_run_script(js_var: &str, run: &str) -> String {
     let escaped = run
         .replace('\\', "\\\\")
         .replace('`', "\\`")
         .replace('$', "\\$");
+    let insert_text = insert_text_js("el", &format!("`{escaped}`"));
     format!(
         r"(function() {{
                 var el = window.{js_var};
@@ -583,29 +643,48 @@ pub fn build_append_run_script(js_var: &str, run: &str) -> String {
                     return true;
                 }}
                 el.focus();
-                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
+                {insert_text}
+                return true;
+            }})()"
+    )
+}
+
+/// JS statements inserting the string expression `text_js` into `el` at its selection, replacing
+/// any selected range, then firing `input`. Inputs without a selection API (e.g. `email`) append.
+fn insert_text_js(el: &str, text_js: &str) -> String {
+    format!(
+        r"var insertedText = {text_js};
+                if ({el}.tagName === 'INPUT' || {el}.tagName === 'TEXTAREA') {{
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
+                        {el}.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
                         'value'
                     ).set;
-                    nativeInputValueSetter.call(el, el.value + `{escaped}`);
-                    el.dispatchEvent(new InputEvent('input', {{
+                    var currentValue = {el}.value;
+                    var selStart = null;
+                    var selEnd = null;
+                    try {{
+                        selStart = {el}.selectionStart;
+                        selEnd = {el}.selectionEnd;
+                    }} catch (e) {{}}
+                    if (typeof selStart === 'number' && typeof selEnd === 'number') {{
+                        nativeInputValueSetter.call(
+                            {el},
+                            currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)
+                        );
+                        var caret = selStart + insertedText.length;
+                        {el}.setSelectionRange(caret, caret);
+                    }} else {{
+                        nativeInputValueSetter.call({el}, currentValue + insertedText);
+                    }}
+                    {el}.dispatchEvent(new InputEvent('input', {{
                         bubbles: true,
                         cancelable: true,
                         inputType: 'insertText',
-                        data: `{escaped}`
+                        data: insertedText
                     }}));
-                    try {{
-                        if (typeof el.setSelectionRange === 'function') {{
-                            var end = (el.value || '').length;
-                            el.setSelectionRange(end, end);
-                        }}
-                    }} catch (e) {{}}
-                }} else if (el.isContentEditable) {{
-                    document.execCommand('insertText', false, `{escaped}`);
-                }}
-                return true;
-            }})()"
+                }} else if ({el}.isContentEditable) {{
+                    document.execCommand('insertText', false, insertedText);
+                }}"
     )
 }
 
@@ -635,6 +714,7 @@ mod tests {
     const ARROW_DOWN: &str = "\u{E015}";
     const SHIFT: &str = "\u{E008}";
     const CONTROL: &str = "\u{E009}";
+    const CONTROL_RIGHT: &str = "\u{E051}";
     const ALT: &str = "\u{E00A}";
 
     fn special_key_range() -> impl Iterator<Item = char> {
@@ -801,13 +881,35 @@ mod tests {
 
     #[test]
     fn build_special_key_script_dispatches_keyboard_event() {
-        let script = build_special_key_script("PageDown", "PageDown", 34, true);
+        let none = ModifierState::default();
+        let script = build_special_key_script("PageDown", "PageDown", 34, true, &none);
         assert!(script.contains("new KeyboardEvent('keydown'"));
         assert!(script.contains("key: 'PageDown'"));
         assert!(script.contains("keyCode: 34"));
+        assert!(script.contains("shiftKey: false"));
 
-        let up = build_special_key_script("PageDown", "PageDown", 34, false);
+        let up = build_special_key_script("PageDown", "PageDown", 34, false, &none);
         assert!(up.contains("new KeyboardEvent('keyup'"));
+    }
+
+    #[test]
+    fn build_special_key_script_carries_held_modifiers_on_every_event() {
+        let shift = mods(false, true, false, false);
+        let ctrl_alt_meta = mods(true, false, true, true);
+        for script in [
+            build_special_key_script("Enter", "Enter", 13, true, &shift),
+            build_special_key_script("Enter", "Enter", 13, false, &shift),
+            build_special_key_script("Backspace", "Backspace", 8, true, &shift),
+            build_special_key_script("ArrowDown", "ArrowDown", 40, true, &shift),
+        ] {
+            assert!(script.contains("shiftKey: true"), "{script}");
+            assert!(script.contains("ctrlKey: false"), "{script}");
+        }
+        let chord = build_special_key_script("Home", "Home", 36, true, &ctrl_alt_meta);
+        assert!(chord.contains("ctrlKey: true"));
+        assert!(chord.contains("altKey: true"));
+        assert!(chord.contains("metaKey: true"));
+        assert!(chord.contains("shiftKey: false"));
     }
 
     #[test]
@@ -834,7 +936,29 @@ mod tests {
         assert!(script.contains("key: '5'"));
         assert!(script.contains("code: 'Numpad5'"));
         assert!(script.contains("keyCode: 101"));
-        assert!(script.contains("activeEl.value + '5'"));
+        assert!(script.contains("var insertedText = '5'"));
+    }
+
+    #[test]
+    fn build_printable_key_script_types_into_contenteditable() {
+        let script =
+            build_printable_key_script(" ", "Space", 32, true, &mods(false, false, false, false));
+        assert!(script.contains("activeEl.isContentEditable"));
+        assert!(script.contains("document.execCommand('insertText', false, insertedText)"));
+    }
+
+    #[test]
+    fn typed_text_replaces_the_selection() {
+        let none = mods(false, false, false, false);
+        for script in [
+            build_printable_key_script("5", "Numpad5", 101, true, &none),
+            build_insert_run_script("__wd_el_abc", "new"),
+        ] {
+            assert!(script.contains(
+                "currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)"
+            ));
+            assert!(script.contains("setSelectionRange(caret, caret)"));
+        }
     }
 
     #[test]
@@ -901,6 +1025,42 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_drops_null_keys() {
+        assert_eq!(plan_send_keys(&format!("a{NULL_KEY}b")), vec![text("ab")]);
+        assert_eq!(
+            plain_text(&plan_send_keys(&format!("a{NULL_KEY}b"))),
+            Some("ab")
+        );
+        assert_eq!(plain_text(&plan_send_keys(NULL_KEY)), Some(""));
+        assert_eq!(plain_text(&plan_send_keys("")), Some(""));
+        assert_eq!(plain_text(&plan_send_keys(&format!("hi{ENTER}"))), None);
+    }
+
+    #[test]
+    fn held_modifiers_track_each_hand() {
+        let mut held = HeldModifiers::default();
+        assert!(held.press(CONTROL));
+        assert!(held.press(CONTROL_RIGHT));
+        assert!(!held.press(CONTROL));
+        assert!(!held.press("a"));
+        assert!(held.release(CONTROL_RIGHT));
+        assert_eq!(held.state(), mods(true, false, false, false));
+        assert!(held.release(CONTROL));
+        assert_eq!(held.state(), ModifierState::default());
+        assert!(!held.release(CONTROL));
+    }
+
+    #[test]
+    fn held_modifiers_map_every_modifier_key() {
+        let mut held = HeldModifiers::default();
+        for key in ["\u{E050}", "\u{E052}", "\u{E053}"] {
+            held.press(key);
+        }
+        assert_eq!(held.state(), mods(false, true, true, true));
+        assert_eq!(held.keys(), vec!["\u{E050}", "\u{E052}", "\u{E053}"]);
+    }
+
+    #[test]
     fn plan_send_keys_presses_special_keys_between_text_runs() {
         let none = ModifierState::default();
         assert_eq!(
@@ -918,6 +1078,7 @@ mod tests {
 
     #[test]
     fn plan_send_keys_holds_modifiers_until_the_end() {
+        let none = ModifierState::default();
         let shift = mods(false, true, false, false);
         assert_eq!(
             plan_send_keys(&format!("{SHIFT}ab{ENTER}")),
@@ -926,13 +1087,14 @@ mod tests {
                 text("ab"),
                 key(ENTER, true, shift),
                 key(ENTER, false, shift),
-                key(SHIFT, false, shift),
+                key(SHIFT, false, none),
             ]
         );
     }
 
     #[test]
     fn plan_send_keys_presses_text_as_shortcuts_under_control() {
+        let none = ModifierState::default();
         let ctrl = mods(true, false, false, false);
         assert_eq!(
             plan_send_keys(&format!("{CONTROL}a{BACKSPACE}")),
@@ -942,13 +1104,14 @@ mod tests {
                 key("a", false, ctrl),
                 key(BACKSPACE, true, ctrl),
                 key(BACKSPACE, false, ctrl),
-                key(CONTROL, false, ctrl),
+                key(CONTROL, false, none),
             ]
         );
     }
 
     #[test]
     fn plan_send_keys_null_key_releases_modifiers() {
+        let none = ModifierState::default();
         let ctrl = mods(true, false, false, false);
         assert_eq!(
             plan_send_keys(&format!("{CONTROL}a{NULL_KEY}b")),
@@ -956,7 +1119,7 @@ mod tests {
                 key(CONTROL, true, ctrl),
                 key("a", true, ctrl),
                 key("a", false, ctrl),
-                key(CONTROL, false, ctrl),
+                key(CONTROL, false, none),
                 text("b"),
             ]
         );
@@ -964,6 +1127,7 @@ mod tests {
 
     #[test]
     fn plan_send_keys_ignores_a_repeated_modifier_and_releases_in_code_point_order() {
+        let none = ModifierState::default();
         let alt = mods(false, false, true, false);
         let alt_shift = mods(false, true, true, false);
         assert_eq!(
@@ -971,8 +1135,22 @@ mod tests {
             vec![
                 key(ALT, true, alt),
                 key(SHIFT, true, alt_shift),
-                key(SHIFT, false, alt_shift),
-                key(ALT, false, alt),
+                key(SHIFT, false, alt),
+                key(ALT, false, none),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_send_keys_keeps_control_while_the_other_hand_holds_it() {
+        let ctrl = mods(true, false, false, false);
+        let steps = plan_send_keys(&format!("{CONTROL}{CONTROL_RIGHT}a"));
+        assert_eq!(steps[2], key("a", true, ctrl));
+        assert_eq!(
+            steps[4..],
+            [
+                key(CONTROL, false, ctrl),
+                key(CONTROL_RIGHT, false, ModifierState::default()),
             ]
         );
     }
@@ -983,21 +1161,23 @@ mod tests {
         assert!(script.contains("throw new Error('stale element reference')"));
         assert!(script.contains("el.focus()"));
         assert!(script.contains("setSelectionRange(end, end)"));
+        assert!(script.contains("el.isContentEditable && !wasFocused"));
+        assert!(script.contains("range.collapse(false)"));
     }
 
     #[test]
-    fn build_append_run_script_appends_fires_input_and_defers_change() {
-        let script = build_append_run_script("__wd_el_abc", "hi");
+    fn build_insert_run_script_inserts_fires_input_and_defers_change() {
+        let script = build_insert_run_script("__wd_el_abc", "hi");
         assert!(script.contains("window.__wd_el_abc"));
-        assert!(script.contains("el.value + `hi`"));
+        assert!(script.contains("var insertedText = `hi`"));
         assert!(script.contains("inputType: 'insertText'"));
-        assert!(script.contains("setSelectionRange"));
+        assert!(script.contains("document.execCommand('insertText', false, insertedText)"));
         assert!(!script.contains("new Event('change'"));
     }
 
     #[test]
-    fn build_append_run_script_escapes_backtick_dollar_and_backslash() {
-        let script = build_append_run_script("v", "a`$\\b");
+    fn build_insert_run_script_escapes_backtick_dollar_and_backslash() {
+        let script = build_insert_run_script("v", "a`$\\b");
         assert!(script.contains(r"a\`\$\\b"));
     }
 
