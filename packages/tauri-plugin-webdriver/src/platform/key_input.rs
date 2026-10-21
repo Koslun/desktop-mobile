@@ -125,7 +125,7 @@ pub fn regular_key_code_for(key: &str) -> String {
 }
 
 /// JS dispatching a synthetic special-key `KeyboardEvent` plus the value/selection/radio
-/// side-effects an untrusted event can't drive itself.
+/// side-effects an untrusted event can't drive itself, skipped when a handler cancels the keydown.
 pub fn build_special_key_script(
     js_key: &str,
     js_code: &str,
@@ -156,7 +156,9 @@ pub fn build_special_key_script(
                         bubbles: true,
                         cancelable: true
                     }});
-                    activeEl.dispatchEvent(keydownEvent);
+                    if (!activeEl.dispatchEvent(keydownEvent)) {{
+                        return true;
+                    }}
 
                     if (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') {{
                         var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -225,7 +227,9 @@ pub fn build_special_key_script(
                         bubbles: true,
                         cancelable: true
                     }});
-                    activeEl.dispatchEvent(keydownEvent);
+                    if (!activeEl.dispatchEvent(keydownEvent)) {{
+                        return true;
+                    }}
 
                     if (activeEl.tagName === 'INPUT' && activeEl.type === 'radio' && activeEl.name) {{
                         var name = activeEl.name;
@@ -275,8 +279,9 @@ pub fn build_special_key_script(
     }
 }
 
-/// JS dispatching a synthetic printable-character `KeyboardEvent` plus the input-value mutation
-/// and Ctrl/Meta+A select-all an untrusted event can't drive itself.
+/// JS dispatching a synthetic printable-character `KeyboardEvent` plus the text insertion and
+/// Ctrl/Meta+A select-all an untrusted event can't drive itself, skipped when a handler cancels the
+/// keydown.
 pub fn build_regular_key_script(
     key: &str,
     code: &str,
@@ -327,7 +332,9 @@ pub fn build_printable_key_script(
                         bubbles: true,
                         cancelable: true
                     }});
-                    activeEl.dispatchEvent(keydownEvent);
+                    if (!activeEl.dispatchEvent(keydownEvent)) {{
+                        return true;
+                    }}
 
                     if (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') {{
                         activeEl.select();
@@ -355,7 +362,9 @@ pub fn build_printable_key_script(
                         bubbles: true,
                         cancelable: true
                     }});
-                    activeEl.dispatchEvent(keydownEvent);
+                    if (!activeEl.dispatchEvent(keydownEvent)) {{
+                        return true;
+                    }}
 
                     if (!{ctrl_key} && !{meta_key} && !{alt_key}) {{
                         {insert_text}
@@ -958,6 +967,50 @@ mod tests {
                 "currentValue.slice(0, selStart) + insertedText + currentValue.slice(selEnd)"
             ));
             assert!(script.contains("setSelectionRange(caret, caret)"));
+        }
+    }
+
+    #[test]
+    fn default_actions_wait_for_an_uncanceled_keydown() {
+        let none = mods(false, false, false, false);
+        let ctrl = mods(true, false, false, false);
+        let guard =
+            "if (!activeEl.dispatchEvent(keydownEvent)) {\n                        return true;";
+        for (script, side_effect) in [
+            (
+                build_printable_key_script(" ", "Space", 32, true, &none),
+                "var insertedText",
+            ),
+            (
+                build_regular_key_script("x", "KeyX", true, &none),
+                "var insertedText",
+            ),
+            (
+                build_regular_key_script("a", "KeyA", true, &ctrl),
+                "activeEl.select()",
+            ),
+            (
+                build_special_key_script("Backspace", "Backspace", 8, true, &none),
+                "nativeInputValueSetter",
+            ),
+            (
+                build_special_key_script("Delete", "Delete", 46, true, &none),
+                "nativeInputValueSetter",
+            ),
+            (
+                build_special_key_script("ArrowDown", "ArrowDown", 40, true, &none),
+                "nextRadio.checked",
+            ),
+        ] {
+            let guard_at = script
+                .find(guard)
+                .unwrap_or_else(|| panic!("no guard in {script}"));
+            let effect_at = script.find(side_effect).unwrap();
+            assert!(
+                guard_at < effect_at,
+                "{side_effect} runs before the guard in {script}"
+            );
+            assert!(!script.contains("activeEl.dispatchEvent(keydownEvent);"));
         }
     }
 

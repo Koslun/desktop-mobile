@@ -28,8 +28,8 @@ async function keyTargetEvents() {
   return (await browser.execute('return window.__keyTargetEvents || []')) as unknown as KeyEvent[];
 }
 
-async function editorText() {
-  const text = (await browser.execute('return document.querySelector("#keys-editor").textContent')) as string;
+async function editorText(selector = '#keys-editor') {
+  const text = (await browser.execute(`return document.querySelector("${selector}").textContent`)) as string;
   return text.replace(/ /g, ' ');
 }
 
@@ -44,7 +44,9 @@ describe('special keys (embedded)', () => {
     await browser.execute(
       'window.__keyTargetEvents = [];' +
         'document.querySelector("#keys-input").value = "";' +
-        'document.querySelector("#keys-editor").textContent = "";',
+        'document.querySelector("#keys-editor").textContent = "";' +
+        'document.querySelector("#keys-blocking-input").value = "";' +
+        'document.querySelector("#keys-blocking-editor").textContent = "";',
     );
   });
 
@@ -115,6 +117,27 @@ describe('special keys (embedded)', () => {
   it('should type printable special keys into a contenteditable', async () => {
     await browser.$('#keys-editor').addValue(`a${Key.Space}b`);
     expect(await editorText()).toBe('a b');
+  });
+
+  it('should not type or delete in an input when the keydown is canceled', async () => {
+    await browser.execute('document.querySelector("#keys-blocking-input").value = "ab";');
+    const input = browser.$('#keys-blocking-input');
+    await input.addValue(`c${Key.Space}`);
+    expect(await input.getValue()).toBe('abc');
+    await input.addValue(Key.Backspace);
+    expect(await input.getValue()).toBe('abc');
+    await browser.keys('x');
+    await browser.keys('y');
+    expect(await input.getValue()).toBe('abcy');
+  });
+
+  it('should not type in a contenteditable when the keydown is canceled', async () => {
+    await browser.execute('document.querySelector("#keys-blocking-editor").textContent = "ab";');
+    await browser.$('#keys-blocking-editor').addValue(`c${Key.Space}`);
+    expect(await editorText('#keys-blocking-editor')).toBe('abc');
+    await browser.keys('x');
+    await browser.keys('y');
+    expect(await editorText('#keys-blocking-editor')).toBe('abcy');
   });
 
   it('should keep Control held while the other hand still holds it', async () => {
