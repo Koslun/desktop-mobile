@@ -122,13 +122,9 @@ pub fn regular_key_code_for(key: &str) -> String {
     }
 }
 
-/// A JS string literal for `text` that is safe to splice into a script, including inside HTML.
+/// A JS string literal for `text` that is safe to splice into a script.
 pub fn js_string(text: &str) -> String {
-    let mut literal = serde_json::Value::from(text).to_string();
-    for ch in ['\u{2028}', '\u{2029}', '<'] {
-        literal = literal.replace(ch, &format!("\\u{:04x}", u32::from(ch)));
-    }
-    literal
+    serde_json::Value::from(text).to_string()
 }
 
 /// JS binding `var` to the focused element, looking through open shadow roots.
@@ -567,24 +563,6 @@ pub fn typed_text(steps: &[SendKeysStep]) -> String {
             SendKeysStep::Key { .. } => None,
         })
         .collect()
-}
-
-/// The key-ups for the modifiers still held after the first `done` steps, so a request that fails
-/// part-way doesn't leave them pressed.
-pub fn modifier_releases(steps: &[SendKeysStep], done: usize) -> Vec<SendKeysStep> {
-    let mut held = HeldModifiers::default();
-    for step in steps.iter().take(done) {
-        if let SendKeysStep::Key { value, is_down, .. } = step {
-            if *is_down {
-                held.press(value);
-            } else {
-                held.release(value);
-            }
-        }
-    }
-    let mut releases = Vec::new();
-    release_held_modifiers(&mut releases, &mut held);
-    releases
 }
 
 fn push_text(steps: &mut Vec<SendKeysStep>, run: &str) {
@@ -1036,13 +1014,11 @@ mod tests {
     }
 
     #[test]
-    fn js_string_escapes_line_breaks_quotes_and_markup() {
-        let text = "a'\"\\\n\u{2028}\u{2029}</script>";
+    fn js_string_escapes_line_breaks_and_quotes() {
+        let text = "a'\"\\\n";
         let literal = js_string(text);
         assert!(literal.starts_with('"') && literal.ends_with('"'));
-        for raw in ['\n', '\u{2028}', '\u{2029}', '<'] {
-            assert!(!literal.contains(raw), "{literal:?} contains {raw:?}");
-        }
+        assert!(!literal.contains('\n'));
         assert_eq!(serde_json::from_str::<String>(&literal).unwrap(), text);
     }
 
@@ -1239,25 +1215,6 @@ mod tests {
         let held = HeldModifiers::from_keys(&pressed);
         assert_eq!(held.state(), mods(true, true, false, false));
         assert_eq!(held.keys(), vec![SHIFT, CONTROL_RIGHT]);
-    }
-
-    #[test]
-    fn modifier_releases_let_go_of_modifiers_held_when_a_step_fails() {
-        let none = ModifierState::default();
-        let ctrl = mods(true, false, false, false);
-        let steps = plan_send_keys(&format!("{SHIFT}{CONTROL}a{ENTER}"));
-        assert_eq!(modifier_releases(&steps, 0), vec![]);
-        assert_eq!(modifier_releases(&steps, 1), vec![key(SHIFT, false, none)]);
-        assert_eq!(
-            modifier_releases(&steps, 3),
-            vec![key(SHIFT, false, ctrl), key(CONTROL, false, none)]
-        );
-        let all = steps.len();
-        assert_eq!(
-            modifier_releases(&steps, all - 1),
-            vec![key(CONTROL, false, none)]
-        );
-        assert_eq!(modifier_releases(&steps, all), vec![]);
     }
 
     #[test]

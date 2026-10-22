@@ -871,30 +871,17 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 ))
             }
         }
-        for (done, step) in steps.iter().enumerate() {
-            let outcome = match step {
-                SendKeysStep::Text(run) => self
-                    .evaluate_js(&key_input::build_insert_run_script(run))
-                    .await
-                    .map(|_| ()),
+        for step in &steps {
+            match step {
+                SendKeysStep::Text(run) => {
+                    self.evaluate_js(&key_input::build_insert_run_script(run))
+                        .await?;
+                }
                 SendKeysStep::Key {
                     value,
                     is_down,
                     modifiers,
-                } => self.dispatch_key_event(value, *is_down, modifiers).await,
-            };
-            if let Err(error) = outcome {
-                for release in key_input::modifier_releases(&steps, done) {
-                    if let SendKeysStep::Key {
-                        value,
-                        is_down,
-                        modifiers,
-                    } = release
-                    {
-                        let _ = self.dispatch_key_event(&value, is_down, &modifiers).await;
-                    }
-                }
-                return Err(error);
+                } => self.dispatch_key_event(value, *is_down, modifiers).await?,
             }
         }
         if let Some(initial_value) = start.get("value").and_then(Value::as_str) {
