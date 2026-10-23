@@ -12,7 +12,8 @@ vi.mock('../src/diagnostics.js', () => ({
   diagnoseTauriEnvironment: vi.fn().mockResolvedValue([]),
 }));
 
-vi.mock('@wdio/native-utils', () => ({
+vi.mock('@wdio/native-utils', async (importOriginal) => ({
+  errorMessage: (await importOriginal<typeof import('@wdio/native-utils')>()).errorMessage,
   createLogger: () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }),
   formatDiagnosticResults: vi.fn(),
   isErr: vi.fn().mockReturnValue(false),
@@ -35,7 +36,8 @@ vi.mock('../src/driverPool.js', () => ({
   },
 }));
 
-vi.mock('../src/portManager.js', () => ({
+vi.mock('@wdio/native-core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@wdio/native-core')>()),
   PortManager: class MockPortManager {
     allocatePortPair = vi.fn().mockResolvedValue({ port: 4444, nativePort: 4445 });
     allocatePorts = vi.fn().mockResolvedValue([{ port: 4444, nativePort: 4445 }]);

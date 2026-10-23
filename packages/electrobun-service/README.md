@@ -59,9 +59,10 @@ The Linux path drives the native WebKitGTK renderer over **W3C WebDriver** via
 headless machines. Install both the WebKitGTK driver and Xvfb:
 
 ```sh
-sudo apt-get install webkit2gtk-driver xvfb            # Debian/Ubuntu
-# dnf install webkit2gtk-driver xorg-x11-server-Xvfb   # Fedora
-# pacman -S webkit2gtk-driver xorg-server-xvfb         # Arch
+sudo apt-get install webkitgtk-webdriver xvfb     # Ubuntu 26.04+, Debian 13+
+# apt-get install webkit2gtk-driver xvfb          # Ubuntu 24.04 and older, Debian 12
+# dnf install webkitgtk6.0 xorg-x11-server-Xvfb   # Fedora
+# pacman -S webkitgtk-6.0 xorg-server-xvfb        # Arch
 ```
 
 Native Linux support requires **electrobun ≥ 2.0.1**, which exposes WebKitGTK automation upstream
@@ -120,7 +121,7 @@ tracked in [#320](https://github.com/webdriverio/desktop-mobile/issues/320); the
 
 | Area | Status |
 |---|---|
-| multiremote / parallel workers | ✅ Windows — WebView2 isolates each instance, so parallel workers and multiremote both work; ✅ Linux parallel workers, each with its own `WebKitWebDriver` + app; ⚠️ Linux multiremote (multiple instances per worker) not yet wired; ❌ macOS CEF — instances fold together, per the root cause above. |
+| multiremote / parallel workers | ✅ Windows — WebView2 isolates each instance, so parallel workers and multiremote both work; ✅ Linux — WebKitGTK clones the bundle per instance (each gets its own `WebKitWebDriver` + app), so parallel workers and multiremote both work; ❌ macOS CEF — instances fold together, per the root cause above. |
 | `switchWindow` / `listWindows` | ✅ Windows; ⚠️ macOS CEF unreliable — two windows race in the shared global context, so run locally; ⚠️ Linux best-effort — W3C window handles mapped by order. |
 | `triggerDeeplink` | ⚠️ macOS unreliable — no `open-url` routing to the spawned instance; ❌ Windows/Linux upstream-blocked — Electrobun registers URL schemes and wires `open-url` macOS-only ([blackboardsh/electrobun#465](https://github.com/blackboardsh/electrobun/issues/465)). |
 | single-window apps | ⚠️ a lone CEF window doesn't reliably appear in `/json`, so the bridge can intermittently find no target to attach to. Opening a second window stabilises target exposure — the fixtures open it staggered behind the first window's `dom-ready`. |

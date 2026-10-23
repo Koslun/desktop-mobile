@@ -11,9 +11,10 @@ vi.mock('../src/providers/embedded.js', () => ({
 vi.mock('@wdio/native-core', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@wdio/native-core')>()),
   startManagedDevServer: vi.fn(),
+  closeLogWriter: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { startManagedDevServer } from '@wdio/native-core';
+import { closeLogWriter, startManagedDevServer } from '@wdio/native-core';
 import DioxusLaunchService from '../src/launcher.js';
 import { startEmbeddedDriver } from '../src/providers/embedded.js';
 import type { DioxusCapabilities, DioxusServiceGlobalOptions } from '../src/types.js';
@@ -46,6 +47,30 @@ describe('DioxusLaunchService — browser mode', () => {
     await launcher.onPrepare(baseConfig, caps);
     expect(caps[0].browserName).toBe('chrome');
     expect(caps[0]['dioxus:options']).toBeUndefined();
+  });
+
+  it('should report browser mode only once a browser-mode onPrepare succeeds', async () => {
+    const launcher = createLauncher();
+    expect(launcher.isBrowserMode).toBe(false);
+
+    await expect(
+      launcher.onPrepare(baseConfig, [{ 'wdio:dioxusServiceOptions': { mode: 'browser' } }]),
+    ).rejects.toThrow('devServerUrl is required');
+    expect(launcher.isBrowserMode).toBe(false);
+
+    await launcher.onPrepare(baseConfig, [
+      { 'wdio:dioxusServiceOptions': { mode: 'browser', devServerUrl: DEV_SERVER } },
+    ]);
+    expect(launcher.isBrowserMode).toBe(true);
+  });
+
+  it('should tell the worker about browser mode set only in the global options', async () => {
+    const launcher = createLauncher({ mode: 'browser', devServerUrl: DEV_SERVER });
+    const capabilities: DioxusCapabilities[] = [{}];
+
+    await launcher.onPrepare(baseConfig, capabilities);
+
+    expect(capabilities[0]['wdio:dioxusServiceOptions']).toMatchObject({ mode: 'browser', devServerUrl: DEV_SERVER });
   });
 
   it('does not start the embedded driver in browser mode', async () => {
@@ -109,6 +134,15 @@ describe('DioxusLaunchService — devServer management', () => {
     expect(startManagedDevServer).toHaveBeenCalledWith('pnpm dev', DEV_SERVER);
     await launcher.onComplete();
     expect(managedStop).toHaveBeenCalledOnce();
+  });
+
+  it('should still close the log writer when the dev server stop throws', async () => {
+    managedStop.mockRejectedValueOnce(new Error('dev server close boom'));
+    const launcher = createLauncher({ mode: 'browser', devServerUrl: DEV_SERVER, devServer: 'pnpm dev' });
+    await launcher.onPrepare(baseConfig, [{}] as DioxusCapabilities[]);
+
+    await expect(launcher.onComplete()).rejects.toThrow('dev server close boom');
+    expect(closeLogWriter).toHaveBeenCalledWith('dioxus-service');
   });
 
   it('should skip the HEAD preflight when managing the dev server', async () => {

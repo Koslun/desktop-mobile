@@ -5,15 +5,17 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
+use tauri::webview::PlatformWebview;
 use tauri::{Manager, Runtime, WebviewWindow};
 use tokio::sync::oneshot;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2, ICoreWebView2CallDevToolsProtocolMethodCompletedHandler,
-    ICoreWebView2CapturePreviewCompletedHandler, ICoreWebView2Environment6,
-    ICoreWebView2ExecuteScriptCompletedHandler, ICoreWebView2PrintToPdfCompletedHandler,
-    ICoreWebView2ScriptDialogOpeningEventHandler, ICoreWebView2WebMessageReceivedEventHandler,
-    ICoreWebView2_7, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
-    COREWEBVIEW2_PRINT_ORIENTATION_LANDSCAPE, COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT,
+    ICoreWebView2CapturePreviewCompletedHandler, ICoreWebView2Controller,
+    ICoreWebView2Environment6, ICoreWebView2ExecuteScriptCompletedHandler,
+    ICoreWebView2PrintToPdfCompletedHandler, ICoreWebView2ScriptDialogOpeningEventHandler,
+    ICoreWebView2WebMessageReceivedEventHandler, ICoreWebView2_7,
+    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, COREWEBVIEW2_PRINT_ORIENTATION_LANDSCAPE,
+    COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT,
 };
 use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HGLOBAL;
@@ -113,6 +115,15 @@ impl SendableComPtr {
     }
 }
 
+// Tauri doesn't re-export webview2-com and can move to a semver-incompatible version of it in a
+// minor release, so rebind onto our copy rather than tie the plugin to Tauri minors that match ours.
+#[allow(clippy::useless_transmute)]
+fn rebind_controller(webview: &PlatformWebview) -> ICoreWebView2Controller {
+    // SAFETY: both types are #[repr(transparent)] pointers to the same WebView2 COM object,
+    // whose layout is fixed by WebView2, not by the crate version.
+    unsafe { std::mem::transmute::<_, ICoreWebView2Controller>(webview.controller()) }
+}
+
 /// Windows `WebView2` executor
 #[derive(Clone)]
 pub struct WindowsExecutor<R: Runtime> {
@@ -147,7 +158,7 @@ impl<R: Runtime + 'static> WindowsExecutor<R> {
             move |webview| unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-                if let Ok(webview2) = webview.controller().CoreWebView2() {
+                if let Ok(webview2) = rebind_controller(&webview).CoreWebView2() {
                     let script_hstring = HSTRING::from(&script_owned);
 
                     let handler: ICoreWebView2ExecuteScriptCompletedHandler =
@@ -217,7 +228,7 @@ impl<R: Runtime + 'static> WindowsExecutor<R> {
             move |webview| unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-                if let Ok(webview2) = webview.controller().CoreWebView2() {
+                if let Ok(webview2) = rebind_controller(&webview).CoreWebView2() {
                     let method_hstring = HSTRING::from(&method_owned);
                     let params_hstring = HSTRING::from(&params_owned);
 
@@ -229,10 +240,13 @@ impl<R: Runtime + 'static> WindowsExecutor<R> {
                         PCWSTR(params_hstring.as_ptr()),
                         &handler,
                     ) {
-                        tracing::error!("CallDevToolsProtocolMethod '{method_owned}' failed: {e:?}");
+                        tracing::error!(
+                            "CallDevToolsProtocolMethod '{method_owned}' failed: {e:?}"
+                        );
                         if let Ok(mut guard) = tx.lock() {
                             if let Some(tx) = guard.take() {
-                                let _ = tx.send(Err(format!("CallDevToolsProtocolMethod failed: {e:?}")));
+                                let _ = tx
+                                    .send(Err(format!("CallDevToolsProtocolMethod failed: {e:?}")));
                             }
                         }
                     }
@@ -263,7 +277,7 @@ impl<R: Runtime + 'static> WindowsExecutor<R> {
             Ok(Err(_)) => {
                 tracing::error!("Channel closed unexpectedly during CDP call");
                 Err(WebDriverErrorResponse::unknown_error("Channel closed"))
-            },
+            }
             Err(_) => Err(WebDriverErrorResponse::script_timeout()),
         }
     }
@@ -280,7 +294,7 @@ pub fn register_webview_handlers<R: Runtime>(webview: &tauri::Webview<R>) {
     let _ = webview.with_webview(move |webview| unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        if let Ok(webview2) = webview.controller().CoreWebView2() {
+        if let Ok(webview2) = rebind_controller(&webview).CoreWebView2() {
             // Disable default script dialogs so ScriptDialogOpening event fires
             if let Ok(settings) = webview2.Settings() {
                 if let Err(e) = settings.SetAreDefaultScriptDialogsEnabled(false) {
@@ -345,142 +359,11 @@ impl<R: Runtime + 'static> PlatformExecutor<R> for WindowsExecutor<R> {
         modifiers: &ModifierState,
     ) -> Result<(), WebDriverErrorResponse> {
         if !self.frame_context.is_empty() {
-            match crate::platform::key_input::map_special_key(key) {
-                Some((js_key, js_code, key_code)) => {
-                    let script = crate::platform::key_input::build_special_key_script(
-                        js_key, js_code, key_code, is_down,
-                    );
-                    self.evaluate_js(&script).await?;
-                    return Ok(());
-                }
-                None => {
-                    let code = crate::platform::key_input::regular_key_code_for(key);
-                    return self.dispatch_regular_key(key, &code, is_down, modifiers).await;
-                }
-            }
+            return self.dispatch_key_event_js(key, is_down, modifiers).await;
         }
         let event = crate::platform::key_input::to_cdp_key_event(key, is_down, modifiers);
         self.call_cdp_method("Input.dispatchKeyEvent", &event.to_params_json())
             .await
-    }
-
-    /// Only reached in-frame (from `dispatch_key_event`); top-level keys dispatch via CDP there.
-    async fn dispatch_regular_key(
-        &self,
-        key: &str,
-        code: &str,
-        is_down: bool,
-        modifiers: &ModifierState,
-    ) -> Result<(), WebDriverErrorResponse> {
-        let script =
-            crate::platform::key_input::build_regular_key_script(key, code, is_down, modifiers);
-        self.evaluate_js(&script).await?;
-        Ok(())
-    }
-
-    async fn send_keys_to_element(
-        &self,
-        js_var: &str,
-        text: &str,
-    ) -> Result<(), WebDriverErrorResponse> {
-        use crate::platform::key_input::KeySegment;
-
-        let segments = crate::platform::key_input::segment_send_keys(text);
-        let has_special_key = segments.iter().any(|seg| matches!(seg, KeySegment::Special(_)));
-
-        // Plain text (no trust-gated special keys), or an in-frame element: the focus-independent JS
-        // path sets the value on the stored element directly, so the text lands on THAT element
-        // regardless of focus changes or detaches, matching macOS/Linux.
-        if !has_special_key || !self.frame_context.is_empty() {
-            let script = crate::platform::key_input::build_send_keys_script(js_var, text);
-            self.evaluate_js(&script).await?;
-            return Ok(());
-        }
-
-        // Top-level text containing special keys. Entry guard, before any side effect — the only
-        // place a throw is safe on this split path. Caret-to-end keeps append semantics; the inner
-        // try/catch absorbs setSelectionRange throwing on non-text inputs.
-        let focus_script = format!(
-            r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
-                }}
-                el.focus();
-                try {{
-                    if (typeof el.setSelectionRange === 'function') {{
-                        var end = (el.value || '').length;
-                        el.setSelectionRange(end, end);
-                    }}
-                }} catch (e) {{}}
-                return document.activeElement === el;
-            }})()"
-        );
-        let target_focusable = self
-            .evaluate_js(&focus_script)
-            .await?
-            .get("value")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !target_focusable {
-            // A `focus`/`focusin` handler refuses focus on the target, so a trusted special key
-            // (needed for Escape's dialog close, Enter's submit, …) cannot be delivered to it and no
-            // browser-default action can fire. Fail here — before any keystroke commits — rather
-            // than commit the text and silently omit the key effect while reporting success.
-            return Err(WebDriverErrorResponse::element_not_interactable(
-                "element does not accept keyboard focus, so the requested key cannot be sent to it",
-            ));
-        }
-
-        // Best-effort refocus before each special key: bring focus back to the target (an append or
-        // a prior key may have moved it). The trusted key is then dispatched regardless of where
-        // focus ended up — per the WebDriver Element Send Keys algorithm, keyboard input follows
-        // focus, so if a handler redirects focus mid-sequence the key lands on the active element
-        // (as a physical keypress would) rather than being dropped or forced onto a stale target.
-        let refocus_script = format!(
-            r"(function() {{
-                var el = window.{js_var};
-                if (el && el.isConnected) {{
-                    el.focus();
-                }}
-                return true;
-            }})()"
-        );
-
-        let no_mods = ModifierState::default();
-        for segment in &segments {
-            match segment {
-                KeySegment::Text(run) => {
-                    let script = crate::platform::key_input::build_append_run_script(js_var, run);
-                    self.evaluate_js(&script).await?;
-                }
-                KeySegment::Special(key) => {
-                    self.evaluate_js(&refocus_script).await?;
-                    let down = crate::platform::key_input::to_cdp_key_event(key, true, &no_mods);
-                    self.call_cdp_method("Input.dispatchKeyEvent", &down.to_params_json())
-                        .await?;
-                    let up = crate::platform::key_input::to_cdp_key_event(key, false, &no_mods);
-                    self.call_cdp_method("Input.dispatchKeyEvent", &up.to_params_json())
-                        .await?;
-                }
-            }
-        }
-
-        // The per-segment appends fire `input` but not `change`. Match the JS path's single trailing
-        // `change` for inputs/textareas. Best-effort: skip (never throw) if the element detached
-        // mid-sequence — the keystrokes already committed, so a stale error here would misreport a
-        // success and duplicate the typing on a caller retry.
-        let change_script = format!(
-            r"(function() {{
-                var el = window.{js_var};
-                if (el && el.isConnected && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {{
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}
-                return true;
-            }})()"
-        );
-        self.evaluate_js(&change_script).await?;
-        Ok(())
     }
 
     // =========================================================================
@@ -493,7 +376,7 @@ impl<R: Runtime + 'static> PlatformExecutor<R> for WindowsExecutor<R> {
 
         let result = self.window.with_webview(move |webview| {
             unsafe {
-                if let Ok(webview2) = webview.controller().CoreWebView2() {
+                if let Ok(webview2) = rebind_controller(&webview).CoreWebView2() {
                     // Create an in-memory stream for the PNG image
                     let stream = match CreateStreamOnHGlobal(HGLOBAL::default(), true) {
                         Ok(s) => s,
@@ -600,7 +483,7 @@ impl<R: Runtime + 'static> PlatformExecutor<R> for WindowsExecutor<R> {
         let result = self.window.with_webview(move |webview| unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-            let webview2 = match webview.controller().CoreWebView2() {
+            let webview2 = match rebind_controller(&webview).CoreWebView2() {
                 Ok(wv) => wv,
                 Err(e) => {
                     if let Ok(mut guard) = tx.lock() {
@@ -774,7 +657,7 @@ impl<R: Runtime + 'static> PlatformExecutor<R> for WindowsExecutor<R> {
             let handler_result = self.window.with_webview(move |webview| unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-                if let Ok(webview2) = webview.controller().CoreWebView2() {
+                if let Ok(webview2) = rebind_controller(&webview).CoreWebView2() {
                     let state = app_clone.state::<AsyncScriptState>();
                     register_message_handler(&webview2, state.inner());
                 }

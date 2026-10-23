@@ -10,16 +10,16 @@ edition = "2021"
 rust-version = "1.77"
 
 [build-dependencies]
-tauri-build = { version = "2.6.0", features = [] }
+tauri-build = { version = "2.7.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.11.1", features = ["tray-icon"] }
-tauri-plugin-fs = "2.5.1"
+tauri = { version = "2.12.4", features = ["tray-icon"] }
+tauri-plugin-fs = "2.7.1"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-wdio = { path = "../../../../packages/tauri-plugin" }
 tauri-plugin-wdio-webdriver = { path = "../../../../packages/tauri-plugin-webdriver" }
-tauri-plugin-automation = "0.1.4"
+tauri-plugin-automation = "0.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.30.5"

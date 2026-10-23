@@ -135,7 +135,10 @@ jobs:
       crates: |
         packages/tauri-plugin
         packages/tauri-plugin-webdriver
-      test_crates: |
+      test-crates: |
+        packages/tauri-plugin-webdriver
+      generated-permissions-crates: |
+        packages/tauri-plugin
         packages/tauri-plugin-webdriver
 
   clippy-tauri-crates-windows:
@@ -149,8 +152,6 @@ jobs:
       crates: |
         packages/tauri-plugin
         packages/tauri-plugin-webdriver
-      test_crates: |
-        packages/tauri-plugin-webdriver
 
   clippy-tauri-crates-macos-arm:
     name: Clippy Tauri Crates [macOS-ARM]
@@ -162,8 +163,6 @@ jobs:
       os: 'macos-latest'
       crates: |
         packages/tauri-plugin
-        packages/tauri-plugin-webdriver
-      test_crates: |
         packages/tauri-plugin-webdriver
 
   # Lint the Dioxus Rust crates. Linux-only for now, matching the v1 scope of
@@ -993,7 +992,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test-type: ['standard']
+        test-type: ['standard', 'multiremote']
     uses: ./.github/workflows/_ci-e2e-electrobun-all-providers.reusable.yml
     secrets: inherit
     with:
@@ -1252,8 +1251,8 @@ jobs:
       - e2e-dioxus-linux
       - e2e-dioxus-windows
       - e2e-dioxus-macos-arm
-      # Electrobun gates: macOS CEF `standard`, Linux WebKitGTK/W3C `standard`, Windows WebView2
-      # `standard` + `window` + `multiremote`.
+      # Electrobun gates: macOS CEF `standard`, Linux WebKitGTK/W3C `standard` + `multiremote`,
+      # Windows WebView2 `standard` + `window` + `multiremote`.
       - e2e-electrobun-macos-arm
       - e2e-electrobun-linux
       # React Native — Android emulator + iOS simulator E2E are required gates.

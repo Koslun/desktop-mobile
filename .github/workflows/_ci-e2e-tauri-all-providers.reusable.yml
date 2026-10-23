@@ -128,7 +128,13 @@ jobs:
         shell: bash
         run: |
           echo "Installing WebKit WebDriver for Linux..."
-          sudo apt-get install -y webkit2gtk-driver
+          # Ubuntu 26.04 renamed webkit2gtk-driver to webkitgtk-webdriver. Without this, apt falls
+          # back to jammy's 2.36 driver (added above), which doesn't match the system WebKitGTK.
+          # 24.04 knows the new name without shipping it, so check for an installable candidate.
+          # Not grep -q: its early exit kills apt-cache with SIGPIPE, which pipefail turns into a miss.
+          webdriver_pkg=webkit2gtk-driver
+          if apt-cache policy webkitgtk-webdriver | grep "Candidate: [^(]" >/dev/null; then webdriver_pkg=webkitgtk-webdriver; fi
+          sudo apt-get install -y "$webdriver_pkg"
           which WebKitWebDriver || echo "WebKitWebDriver not found in PATH"
           WebKitWebDriver --version || echo "WebKitWebDriver version check failed"
 
@@ -630,16 +636,12 @@ jobs:
           failed=false
 
           check_result() {
-            local provider="$1" outcome="$2" allow_fail="${3:-false}" reason="${4:-}"
+            local provider="$1" outcome="$2"
             case "$outcome" in
               success|skipped|"") ;;
               failure)
-                if [ "$allow_fail" = "true" ]; then
-                  echo "::warning::$provider provider tests failed (allowed on $RUNNER_OS — $reason)"
-                else
-                  echo "::error::$provider provider tests failed"
-                  failed=true
-                fi ;;
+                echo "::error::$provider provider tests failed"
+                failed=true ;;
               cancelled)
                 echo "::error::$provider provider tests were cancelled"
                 failed=true ;;
@@ -649,12 +651,9 @@ jobs:
             esac
           }
 
-          allow_official=false; official_reason=""
-          allow_crabnebula=false; crabnebula_reason=""
-
-          check_result "Official" "$official" "$allow_official" "$official_reason"
+          check_result "Official" "$official"
           check_result "Embedded" "$embedded"
-          check_result "CrabNebula" "$crabnebula" "$allow_crabnebula" "$crabnebula_reason"
+          check_result "CrabNebula" "$crabnebula"
 
           # A skipped CrabNebula leg (e.g. no CN_API_KEY) must not count as verified for the keyed run.
           if [ "${{ inputs.require_crabnebula }}" = "true" ] && [ "${{ steps.cn-key.outputs.run }}" != "true" ]; then

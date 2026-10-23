@@ -2,16 +2,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::webview::Cookie as TauriCookie;
-use tauri::{Runtime, WebviewWindow};
-
-#[cfg(desktop)]
-use tauri::Listener;
-#[cfg(desktop)]
-use tauri::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
-
-use tauri::Manager;
+use tauri::{
+    Listener, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Runtime,
+    WebviewWindow,
+};
 
 use crate::platform::alert_state::{AlertStateManager, AlertType};
+use crate::platform::pointer_input::{pointer_event_script, PointerInputState};
 use crate::server::response::WebDriverErrorResponse;
 
 /// Element bounding rectangle
@@ -34,7 +31,6 @@ pub struct WindowRect {
     pub height: u32,
 }
 
-#[cfg(desktop)]
 fn physical_window_rect_to_logical(
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
@@ -51,7 +47,6 @@ fn physical_window_rect_to_logical(
     }
 }
 
-#[cfg(desktop)]
 fn physical_window_chrome_to_logical(
     outer: PhysicalSize<u32>,
     inner: PhysicalSize<u32>,
@@ -64,29 +59,36 @@ fn physical_window_chrome_to_logical(
     .to_logical(scale_factor)
 }
 
-#[cfg(desktop)]
-const WINDOW_CHANGE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const WINDOW_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Apply a native window change and wait for Tauri to confirm it via `event_name`.
+/// Physical-to-logical rounding can leave a requested logical value off by one pixel.
+const LOGICAL_ROUNDING_TOLERANCE: u32 = 1;
+
+/// Apply a native window change and wait, up to `timeout`, until `is_applied` confirms it.
 ///
-/// Only a failure of the native call itself is an error. A window manager may clamp or
-/// ignore a request, in which case the confirming event never arrives — `Set Window Rect`
-/// is best-effort, so callers report the rect the window actually ended up with instead
-/// of failing the command.
-#[cfg(desktop)]
-async fn apply_window_change<R, F>(
+/// `event_name` only triggers a re-check, as the event can predate this change or come from
+/// another window. `is_applied` should return `true` if it can't read the window state, rather
+/// than wait out the timeout.
+///
+/// Only the native call failing is an error; a change the window manager clamps or ignores
+/// just times out.
+pub(crate) async fn apply_window_change<R, F, A>(
     window: &WebviewWindow<R>,
     event_name: &'static str,
     operation: &'static str,
+    timeout: std::time::Duration,
     change: F,
+    is_applied: A,
 ) -> Result<(), WebDriverErrorResponse>
 where
     R: Runtime,
     F: FnOnce() -> tauri::Result<()>,
+    A: Fn() -> bool,
 {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let listener_id = window.once(event_name, move |_| {
-        let _ = sender.send(());
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener_id = window.listen(event_name, {
+        let notify = std::sync::Arc::clone(&notify);
+        move |_| notify.notify_one()
     });
 
     if let Err(error) = change() {
@@ -96,21 +98,97 @@ where
         )));
     }
 
-    match tokio::time::timeout(WINDOW_CHANGE_EVENT_TIMEOUT, receiver).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            tracing::debug!("Window event listener closed while waiting to {operation}");
-        }
-        Err(_) => {
-            window.unlisten(listener_id);
-            tracing::debug!("Timed out waiting to {operation}");
-        }
+    if !wait_until_applied(&notify, timeout, is_applied).await {
+        tracing::debug!("Timed out waiting to {operation}");
     }
 
+    window.unlisten(listener_id);
     Ok(())
 }
 
-#[cfg(all(test, desktop))]
+/// Wait until `is_applied` holds, re-checking on each `notify`; returns `false` on timeout.
+async fn wait_until_applied(
+    notify: &tokio::sync::Notify,
+    timeout: std::time::Duration,
+    is_applied: impl Fn() -> bool,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        while !is_applied() {
+            notify.notified().await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn has_logical_position<R: Runtime>(window: &WebviewWindow<R>, x: i32, y: i32) -> bool {
+    match (window.outer_position(), window.scale_factor()) {
+        (Ok(position), Ok(scale_factor)) => {
+            let position = position.to_logical::<i32>(scale_factor);
+            position.x.abs_diff(x) <= LOGICAL_ROUNDING_TOLERANCE
+                && position.y.abs_diff(y) <= LOGICAL_ROUNDING_TOLERANCE
+        }
+        _ => true,
+    }
+}
+
+fn has_logical_inner_size<R: Runtime>(window: &WebviewWindow<R>, size: LogicalSize<u32>) -> bool {
+    match (window.inner_size(), window.scale_factor()) {
+        (Ok(inner_size), Ok(scale_factor)) => {
+            let inner_size = inner_size.to_logical::<u32>(scale_factor);
+            inner_size.width.abs_diff(size.width) <= LOGICAL_ROUNDING_TOLERANCE
+                && inner_size.height.abs_diff(size.height) <= LOGICAL_ROUNDING_TOLERANCE
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod wait_until_applied_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn returns_at_once_when_already_applied() {
+        let notify = Notify::new();
+        assert!(wait_until_applied(&notify, SHORT_TIMEOUT, || true).await);
+    }
+
+    #[tokio::test]
+    async fn a_stale_event_does_not_end_the_wait() {
+        let notify = Notify::new();
+        notify.notify_one();
+        assert!(!wait_until_applied(&notify, SHORT_TIMEOUT, || false).await);
+    }
+
+    #[tokio::test]
+    async fn ends_when_a_later_event_finds_the_change_applied() {
+        let notify = Arc::new(Notify::new());
+        let applied = Arc::new(AtomicBool::new(false));
+        notify.notify_one();
+        let landing = tokio::spawn({
+            let notify = Arc::clone(&notify);
+            let applied = Arc::clone(&applied);
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                applied.store(true, Ordering::SeqCst);
+                notify.notify_one();
+            }
+        });
+
+        let is_applied = || applied.load(Ordering::SeqCst);
+        assert!(wait_until_applied(&notify, Duration::from_secs(5), is_applied).await);
+        assert!(is_applied(), "returned before the change landed");
+        landing.await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod window_rect_tests {
     use super::*;
 
@@ -195,7 +273,6 @@ pub enum PointerEventType {
     Down,
     Up,
     Move,
-    Click,
 }
 
 /// Cookie data
@@ -244,27 +321,14 @@ pub struct PrintOptions {
     pub page_ranges: Option<Vec<String>>,
 }
 
-/// Tracks the state of modifier keys during action sequences
-#[derive(Debug, Clone, Copy, Default)]
+/// The modifier flags a key event carries; `key_input::HeldModifiers` derives them from the held keys
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ModifierState {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
     pub meta: bool,
-}
-
-impl ModifierState {
-    /// Update modifier state when a key is pressed or released
-    pub fn update(&mut self, key: &str, is_down: bool) {
-        match key {
-            "\u{E009}" => self.ctrl = is_down,  // Control
-            "\u{E008}" => self.shift = is_down, // Shift
-            "\u{E00A}" => self.alt = is_down,   // Alt
-            "\u{E03D}" => self.meta = is_down,  // Meta
-            _ => {}
-        }
-    }
 }
 
 /// Platform-agnostic trait for `WebView` operations.
@@ -686,11 +750,21 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
 
     /// Click on element
     async fn click_element(&self, js_var: &str) -> Result<(), WebDriverErrorResponse> {
+        let active_element = crate::platform::key_input::deep_active_element_js("activeEl");
+        let text_field = crate::platform::key_input::is_text_field_js("el");
         let script = format!(
             r"(function() {{
                 var el = window.{js_var};
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
+                }}
+                {active_element}
+                // A caret set before focus stops WebKit selecting a fresh field's text (or putting a
+                // textarea's caret first), while a select-on-focus handler still picks its own selection.
+                if (activeEl !== el && {text_field}) {{
+                    try {{
+                        el.setSelectionRange(el.value.length, el.value.length);
+                    }} catch (e) {{}}
                 }}
                 el.scrollIntoView({{ block: 'center', inline: 'center' }});
                 el.click();
@@ -714,6 +788,9 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 if (!el || !el.isConnected) {{
                     throw new Error('stale element reference');
                 }}
+                if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (el.disabled || el.readOnly)) {{
+                    return 'not editable';
+                }}
                 el.focus();
                 if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -735,7 +812,11 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 return true;
             }})()"
         );
-        self.evaluate_js(&script).await?;
+        if extract_value(&self.evaluate_js(&script).await?)?.as_str() == Some("not editable") {
+            return Err(WebDriverErrorResponse::invalid_element_state(
+                "element is disabled or read-only, so it cannot be cleared",
+            ));
+        }
         Ok(())
     }
 
@@ -745,8 +826,57 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         js_var: &str,
         text: &str,
     ) -> Result<(), WebDriverErrorResponse> {
-        let script = crate::platform::key_input::build_send_keys_script(js_var, text);
-        self.evaluate_js(&script).await?;
+        use crate::platform::key_input::{self, SendKeysStep};
+
+        let steps = key_input::plan_send_keys(text);
+        let start_script = key_input::build_send_keys_start_script(
+            js_var,
+            &key_input::typed_text(&steps),
+            key_input::plain_text(&steps),
+        );
+        let start = extract_value(&self.evaluate_js(&start_script).await?)?;
+        match start.get("status").and_then(Value::as_str) {
+            Some("done" | "set") => return Ok(()),
+            Some("focused") => {}
+            Some("stale") => return Err(WebDriverErrorResponse::stale_element_reference()),
+            Some("immutable") => {
+                return Err(WebDriverErrorResponse::element_not_interactable(
+                    "form control is read-only or disabled, so its value cannot be set",
+                ))
+            }
+            Some("invalid") => {
+                return Err(WebDriverErrorResponse::invalid_argument(
+                    "text is not a valid value for this form control",
+                ))
+            }
+            Some("file") => {
+                return Err(WebDriverErrorResponse::invalid_argument(
+                    "sending keys to a file input (file upload) is not supported",
+                ))
+            }
+            _ => {
+                return Err(WebDriverErrorResponse::element_not_interactable(
+                    "element did not take keyboard focus, so keys cannot be sent to it",
+                ))
+            }
+        }
+        for step in &steps {
+            match step {
+                SendKeysStep::Text(run) => {
+                    self.evaluate_js(&key_input::build_insert_run_script(run))
+                        .await?;
+                }
+                SendKeysStep::Key {
+                    value,
+                    is_down,
+                    modifiers,
+                } => self.dispatch_key_event(value, *is_down, modifiers).await?,
+            }
+        }
+        if let Some(initial_value) = start.get("value").and_then(Value::as_str) {
+            let change_script = key_input::build_send_keys_change_script(js_var, initial_value);
+            self.evaluate_js(&change_script).await?;
+        }
         Ok(())
     }
 
@@ -1183,16 +1313,37 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         is_down: bool,
         modifiers: &ModifierState,
     ) -> Result<(), WebDriverErrorResponse> {
+        self.dispatch_key_event_js(key, is_down, modifiers).await
+    }
+
+    /// Dispatch a keyboard event as a synthetic (untrusted) JS `KeyboardEvent`.
+    async fn dispatch_key_event_js(
+        &self,
+        key: &str,
+        is_down: bool,
+        modifiers: &ModifierState,
+    ) -> Result<(), WebDriverErrorResponse> {
         match crate::platform::key_input::map_special_key(key) {
+            Some((js_key, js_code, key_code))
+                if crate::platform::key_input::is_printable_key(js_key) =>
+            {
+                let script = crate::platform::key_input::build_printable_key_script(
+                    js_key, js_code, key_code, is_down, modifiers,
+                );
+                self.evaluate_js(&script).await?;
+                Ok(())
+            }
             Some((js_key, js_code, key_code)) => {
-                let script =
-                    crate::platform::key_input::build_special_key_script(js_key, js_code, key_code, is_down);
+                let script = crate::platform::key_input::build_special_key_script(
+                    js_key, js_code, key_code, is_down, modifiers,
+                );
                 self.evaluate_js(&script).await?;
                 Ok(())
             }
             None => {
                 let code = crate::platform::key_input::regular_key_code_for(key);
-                self.dispatch_regular_key(key, &code, is_down, modifiers).await
+                self.dispatch_regular_key(key, &code, is_down, modifiers)
+                    .await
             }
         }
     }
@@ -1205,58 +1356,25 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         is_down: bool,
         modifiers: &ModifierState,
     ) -> Result<(), WebDriverErrorResponse> {
-        let script = crate::platform::key_input::build_regular_key_script(key, code, is_down, modifiers);
+        let script =
+            crate::platform::key_input::build_regular_key_script(key, code, is_down, modifiers);
         self.evaluate_js(&script).await?;
         Ok(())
     }
 
-    /// Dispatch a pointer/mouse event
-    ///
-    /// These are synthetic (`isTrusted: false`). If a click-activation-gated web API (popups,
-    /// clipboard, fullscreen) is ever reported broken on Windows/WebView2, the remedy is to route
-    /// through CDP (`Input.dispatchMouseEvent`) so the click is trusted and grants user activation.
+    /// Dispatch a pointer/mouse event. Returns whether its `pointerdown` was
+    /// canceled (a listener called `preventDefault()`).
     async fn dispatch_pointer_event(
         &self,
         event_type: PointerEventType,
         x: i32,
         y: i32,
         button: u32,
-    ) -> Result<(), WebDriverErrorResponse> {
-        let event_name = match event_type {
-            PointerEventType::Down => "mousedown",
-            PointerEventType::Up => "mouseup",
-            PointerEventType::Move => "mousemove",
-            // Manually dispatched mousedown/mouseup do NOT make the browser
-            // synthesize a click, so element click handlers never fire. The
-            // actions handler emits this explicitly after a same-spot down+up.
-            PointerEventType::Click => "click",
-        };
-
-        let buttons = if matches!(event_type, PointerEventType::Down) {
-            1 << button
-        } else {
-            0
-        };
-        let script = format!(
-            r"(function() {{
-                var el = document.elementFromPoint({x}, {y});
-                if (!el) el = document.body;
-
-                var event = new MouseEvent('{event_name}', {{
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: {x},
-                    clientY: {y},
-                    button: {button},
-                    buttons: {buttons}
-                }});
-                el.dispatchEvent(event);
-                return true;
-            }})()"
-        );
-
-        self.evaluate_js(&script).await?;
-        Ok(())
+        input_state: PointerInputState,
+    ) -> Result<bool, WebDriverErrorResponse> {
+        let script = pointer_event_script(event_type, x, y, button, input_state);
+        let result = self.evaluate_js(&script).await?;
+        extract_bool_value(&result)
     }
 
     /// Dispatch a scroll/wheel event
@@ -1297,7 +1415,6 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
     // =========================================================================
 
     /// Get window rectangle (position and size)
-    #[cfg(desktop)]
     async fn get_window_rect(&self) -> Result<WindowRect, WebDriverErrorResponse> {
         let scale_factor = self.window().scale_factor().map_err(|error| {
             WebDriverErrorResponse::unknown_error(&format!(
@@ -1320,11 +1437,7 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         ))
     }
 
-    #[cfg(mobile)]
-    async fn get_window_rect(&self) -> Result<WindowRect, WebDriverErrorResponse>;
-
     /// Set window rectangle (position and size)
-    #[cfg(desktop)]
     async fn set_window_rect(
         &self,
         rect: WindowRect,
@@ -1341,7 +1454,9 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 self.window(),
                 "tauri://resize",
                 "exit window fullscreen state",
+                WINDOW_CHANGE_TIMEOUT,
                 || self.window().set_fullscreen(false),
+                || !self.window().is_fullscreen().unwrap_or(false),
             )
             .await?;
         }
@@ -1355,7 +1470,9 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 self.window(),
                 "tauri://resize",
                 "restore maximized window",
+                WINDOW_CHANGE_TIMEOUT,
                 || self.window().unmaximize(),
+                || !self.window().is_maximized().unwrap_or(false),
             )
             .await?;
         }
@@ -1385,10 +1502,17 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         let chrome_size = physical_window_chrome_to_logical(outer_size, inner_size, scale_factor);
 
         if rect.x != current_rect.x || rect.y != current_rect.y {
-            apply_window_change(self.window(), "tauri://move", "set window position", || {
-                self.window()
-                    .set_position(LogicalPosition::new(rect.x, rect.y))
-            })
+            apply_window_change(
+                self.window(),
+                "tauri://move",
+                "set window position",
+                WINDOW_CHANGE_TIMEOUT,
+                || {
+                    self.window()
+                        .set_position(LogicalPosition::new(rect.x, rect.y))
+                },
+                || has_logical_position(self.window(), rect.x, rect.y),
+            )
             .await?;
         }
 
@@ -1399,9 +1523,14 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
                 rect.width.saturating_sub(chrome_size.width),
                 rect.height.saturating_sub(chrome_size.height),
             );
-            apply_window_change(self.window(), "tauri://resize", "set window size", || {
-                self.window().set_size(inner_size)
-            })
+            apply_window_change(
+                self.window(),
+                "tauri://resize",
+                "set window size",
+                WINDOW_CHANGE_TIMEOUT,
+                || self.window().set_size(inner_size),
+                || has_logical_inner_size(self.window(), inner_size),
+            )
             .await?;
         }
 
@@ -1409,68 +1538,37 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
     }
 
     /// Maximize window
-    #[cfg(desktop)]
     async fn maximize_window(&self) -> Result<WindowRect, WebDriverErrorResponse> {
-        apply_window_change(self.window(), "tauri://resize", "maximize window", || {
-            self.window().maximize()
-        })
+        apply_window_change(
+            self.window(),
+            "tauri://resize",
+            "maximize window",
+            WINDOW_CHANGE_TIMEOUT,
+            || self.window().maximize(),
+            || self.window().is_maximized().unwrap_or(true),
+        )
         .await?;
         self.get_window_rect().await
     }
 
     /// Minimize window
-    #[cfg(desktop)]
     async fn minimize_window(&self) -> Result<(), WebDriverErrorResponse> {
         let _ = self.window().minimize();
         Ok(())
     }
 
     /// Set window to fullscreen
-    #[cfg(desktop)]
     async fn fullscreen_window(&self) -> Result<WindowRect, WebDriverErrorResponse> {
         apply_window_change(
             self.window(),
             "tauri://resize",
             "enter window fullscreen state",
+            WINDOW_CHANGE_TIMEOUT,
             || self.window().set_fullscreen(true),
+            || self.window().is_fullscreen().unwrap_or(true),
         )
         .await?;
         self.get_window_rect().await
-    }
-
-    /// Set window rectangle (mobile unsupported)
-    #[cfg(mobile)]
-    async fn set_window_rect(
-        &self,
-        _rect: WindowRect,
-    ) -> Result<WindowRect, WebDriverErrorResponse> {
-        Err(WebDriverErrorResponse::unsupported_operation(
-            "Setting window rect is not supported on mobile platforms",
-        ))
-    }
-
-    /// Maximize window (mobile unsupported)
-    #[cfg(mobile)]
-    async fn maximize_window(&self) -> Result<WindowRect, WebDriverErrorResponse> {
-        Err(WebDriverErrorResponse::unsupported_operation(
-            "Maximizing window is not supported on mobile platforms",
-        ))
-    }
-
-    /// Minimize window (mobile unsupported)
-    #[cfg(mobile)]
-    async fn minimize_window(&self) -> Result<(), WebDriverErrorResponse> {
-        Err(WebDriverErrorResponse::unsupported_operation(
-            "Minimizing window is not supported on mobile platforms",
-        ))
-    }
-
-    /// Set window to fullscreen (mobile unsupported)
-    #[cfg(mobile)]
-    async fn fullscreen_window(&self) -> Result<WindowRect, WebDriverErrorResponse> {
-        Err(WebDriverErrorResponse::unsupported_operation(
-            "Fullscreen window is not supported on mobile platforms",
-        ))
     }
 
     // =========================================================================

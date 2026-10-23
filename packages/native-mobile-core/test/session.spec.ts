@@ -1,3 +1,4 @@
+import { DEFAULT_TEARDOWN_TIMEOUT_MS, PROCESS_TEARDOWN_TIMEOUT_MS } from '@wdio/native-utils';
 import type { Options } from '@wdio/types';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -9,10 +10,22 @@ vi.mock('webdriverio', () => ({ remote: (...args: unknown[]) => remoteMock(...ar
 import { createMobileSession } from '../src/session.js';
 
 const onPrepare = vi.fn().mockResolvedValue(undefined);
+const onComplete = vi.fn().mockResolvedValue(undefined);
 const before = vi.fn().mockResolvedValue(undefined);
 const after = vi.fn().mockResolvedValue(undefined);
 
+// FakeLauncher mirrors RN's launcher, which owns Metro and stops it in onComplete.
 class FakeLauncher {
+  constructor(
+    public options: unknown,
+    public capability: unknown,
+    public config: Options.Testrunner,
+  ) {}
+  onPrepare = onPrepare;
+  onComplete = onComplete;
+}
+// Mirrors Flutter's launcher, which owns nothing to stop.
+class NoCompleteLauncher {
   constructor(
     public options: unknown,
     public capability: unknown,
@@ -38,6 +51,7 @@ const makeSession = () =>
 
 const resetMocks = () => {
   onPrepare.mockClear().mockResolvedValue(undefined);
+  onComplete.mockClear().mockResolvedValue(undefined);
   before.mockClear().mockResolvedValue(undefined);
   after.mockClear().mockResolvedValue(undefined);
   deleteSession.mockClear();
@@ -66,11 +80,44 @@ describe('createMobileSession init', () => {
     expect(remoteMock).toHaveBeenCalledWith(expect.objectContaining({ port: 4444, path: '/wd/hub' }));
   });
 
-  it('should delete the session and rethrow when worker.before fails', async () => {
+  it('should delete the session, stop the launcher, and rethrow when worker.before fails', async () => {
     resetMocks();
     before.mockRejectedValueOnce(new Error('before boom'));
     await expect(makeSession().init({ platformName: 'Android' })).rejects.toThrow('before boom');
     expect(deleteSession).toHaveBeenCalled();
+    expect(onComplete).toHaveBeenCalled();
+  });
+
+  it('should stop the launcher when remote() fails (onPrepare already ran)', async () => {
+    resetMocks();
+    remoteMock.mockRejectedValueOnce(new Error('remote boom'));
+    await expect(makeSession().init({ platformName: 'Android' })).rejects.toThrow('remote boom');
+    expect(onComplete).toHaveBeenCalled();
+  });
+
+  it('should surface both the startup error and a launcher-cleanup failure via AggregateError', async () => {
+    resetMocks();
+    before.mockRejectedValueOnce(new Error('before boom'));
+    onComplete.mockRejectedValueOnce(new Error('metro stop boom'));
+    await expect(makeSession().init({ platformName: 'Android' })).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: 'before boom' }),
+      errors: [
+        expect.objectContaining({ message: 'before boom' }),
+        expect.objectContaining({ message: 'metro stop boom' }),
+      ],
+    });
+  });
+
+  it('should not throw for a launcher without onComplete (e.g. Flutter) on a startup failure', async () => {
+    resetMocks();
+    before.mockRejectedValueOnce(new Error('before boom'));
+    const session = createMobileSession<Record<string, unknown>, { platformName?: string }>({
+      LauncherClass: NoCompleteLauncher as never,
+      WorkerClass: FakeWorker as never,
+      logNamespace: 'test-service',
+    });
+    // No onComplete to call, so the original error propagates unchanged.
+    await expect(session.init({ platformName: 'Android' })).rejects.toThrow('before boom');
   });
 
   it('should throw a clear error for an empty capabilities array (no remote() call)', async () => {
@@ -85,7 +132,7 @@ describe('createMobileSession init', () => {
     expect(remoteMock).not.toHaveBeenCalled();
   });
 
-  it('should not open a session if the worker constructor throws', async () => {
+  it('should stop the launcher without opening a session when the worker constructor throws', async () => {
     resetMocks();
     class ThrowingWorker {
       constructor() {
@@ -98,19 +145,97 @@ describe('createMobileSession init', () => {
       logNamespace: 'test-service',
     });
     await expect(session.init({ platformName: 'Android' })).rejects.toThrow('worker ctor boom');
-    // The worker is constructed before remote(), so a ctor throw leaks no live session.
-    expect(remoteMock).not.toHaveBeenCalled();
+    expect(remoteMock).not.toHaveBeenCalled(); // constructed before remote(), so no live session leaks
+    expect(onComplete).toHaveBeenCalled(); // onPrepare already ran, so the launcher is stopped
   });
 });
 
 describe('createMobileSession cleanup', () => {
-  it('should call worker.after and deleteSession for a managed browser', async () => {
+  it('should call worker.after, deleteSession, and launcher.onComplete for a managed browser', async () => {
     resetMocks();
     const session = makeSession();
     const browser = await session.init({ platformName: 'Android' });
     await session.cleanup(browser);
     expect(after).toHaveBeenCalled();
     expect(deleteSession).toHaveBeenCalled();
+    expect(onComplete).toHaveBeenCalled();
+  });
+
+  it('should not throw when launcher.onComplete fails during cleanup (best-effort)', async () => {
+    resetMocks();
+    const session = makeSession();
+    const browser = await session.init({ platformName: 'Android' });
+    onComplete.mockRejectedValueOnce(new Error('metro stop boom'));
+    await expect(session.cleanup(browser)).resolves.toBeUndefined();
+  });
+
+  it('should bound a stalled launcher.onComplete during cleanup so it cannot hang', async () => {
+    resetMocks();
+    const session = makeSession();
+    const browser = await session.init({ platformName: 'Android' });
+    onComplete.mockReturnValueOnce(new Promise<void>(() => {}));
+    vi.useFakeTimers();
+    try {
+      const pending = session.cleanup(browser);
+      await vi.advanceTimersByTimeAsync(PROCESS_TEARDOWN_TIMEOUT_MS);
+      await expect(pending).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should wait past the desktop teardown deadlines for a slow Appium deleteSession', async () => {
+    resetMocks();
+    const session = makeSession();
+    const browser = await session.init({ platformName: 'Android' });
+    let finishDelete: () => void = () => {};
+    deleteSession.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishDelete = resolve;
+      }),
+    );
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const pending = session.cleanup(browser).then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(PROCESS_TEARDOWN_TIMEOUT_MS);
+      expect(settled).toBe(false);
+
+      finishDelete();
+      await pending;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should wait past the default teardown deadline for a slow Metro stop', async () => {
+    resetMocks();
+    const session = makeSession();
+    const browser = await session.init({ platformName: 'Android' });
+    let finishStop: () => void = () => {};
+    onComplete.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishStop = resolve;
+      }),
+    );
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const pending = session.cleanup(browser).then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(DEFAULT_TEARDOWN_TIMEOUT_MS + 5_000);
+      expect(settled).toBe(false);
+
+      finishStop();
+      await pending;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('should warn and no-op (no after, no deleteSession) for a browser it did not create', async () => {

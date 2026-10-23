@@ -2,9 +2,16 @@ import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { nonChromeBrowserNameError, probeDevServerReachable, startManagedDevServer } from '@wdio/native-core';
-import type { LogLevel } from '@wdio/native-types';
-import { createLogger, formatDiagnosticResults, isErr } from '@wdio/native-utils';
+import {
+  closeLogWriter,
+  getLogWriter,
+  isLogWriterInitialized,
+  nonChromeBrowserNameError,
+  PortManager,
+  probeDevServerReachable,
+  startManagedDevServer,
+} from '@wdio/native-core';
+import { createLogger, errorMessage, formatDiagnosticResults, isErr } from '@wdio/native-utils';
 import type { Options } from '@wdio/types';
 import { SevereServiceError } from 'webdriverio';
 import { resolveAppBinaryPath } from './appBinaryResolver.js';
@@ -23,7 +30,7 @@ import {
   stopEmbeddedDriver,
 } from './embeddedProvider.js';
 import { severeServiceError } from './errors.js';
-import { PortManager } from './portManager.js';
+import { mergeServiceOptions } from './serviceConfig.js';
 import type { DriverProvider, TauriCapabilities, TauriServiceGlobalOptions, TauriServiceOptions } from './types.js';
 
 const log = createLogger('tauri-service', 'launcher');
@@ -41,45 +48,25 @@ function generateDataDirectory(instanceId: string): string {
   return dataDir;
 }
 
-// (per-instance env is set when spawning the tauri-driver process)
-
 let officialDeprecationWarned = false;
 
-/**
- * Normalise legacy `driverProvider: 'official'` to the canonical `'external'`.
- * Emits a one-time deprecation warning. `'official'` will be removed in v2.
- */
-function normaliseDriverProvider(value: DriverProvider | undefined): DriverProvider | undefined {
-  if (value === 'official') {
-    if (!officialDeprecationWarned) {
-      log.warn(
-        "driverProvider: 'official' is deprecated; use 'external' instead. " +
-          "The 'official' value will be removed in @wdio/tauri-service v2.",
-      );
-      officialDeprecationWarned = true;
-    }
-    return 'external';
+// mergeServiceOptions maps 'official' to 'external'; this only adds the one-time warning.
+function warnIfOfficialDriverProvider(value: DriverProvider | undefined): void {
+  if (value === 'official' && !officialDeprecationWarned) {
+    log.warn(
+      "driverProvider: 'official' is deprecated; use 'external' instead. " +
+        "The 'official' value will be removed in @wdio/tauri-service v2.",
+    );
+    officialDeprecationWarned = true;
   }
-  return value;
 }
 
-/**
- * Merge global options with capability-specific options
- */
 function mergeOptions(
   globalOptions: TauriServiceGlobalOptions,
   capabilityOptions?: TauriServiceOptions,
 ): TauriServiceOptions {
-  return {
-    ...globalOptions,
-    ...capabilityOptions,
-    driverProvider: normaliseDriverProvider(capabilityOptions?.driverProvider ?? globalOptions.driverProvider),
-    // Log capture options default to false if not specified
-    captureBackendLogs: capabilityOptions?.captureBackendLogs ?? globalOptions.captureBackendLogs ?? false,
-    captureFrontendLogs: capabilityOptions?.captureFrontendLogs ?? globalOptions.captureFrontendLogs ?? false,
-    backendLogLevel: (capabilityOptions?.backendLogLevel ?? globalOptions.backendLogLevel ?? 'info') as LogLevel,
-    frontendLogLevel: (capabilityOptions?.frontendLogLevel ?? globalOptions.frontendLogLevel ?? 'info') as LogLevel,
-  };
+  warnIfOfficialDriverProvider(capabilityOptions?.driverProvider ?? globalOptions.driverProvider);
+  return mergeServiceOptions(globalOptions, capabilityOptions);
 }
 
 /**
@@ -127,6 +114,10 @@ export default class TauriLaunchService {
     this.portManager = new PortManager(basePort, 4445);
     this.backendPortManager = new PortManager(options.crabnebulaBackendPort ?? 3000, 3001);
     this.driverPool = new DriverPool(options, options.nativeDriverPath);
+  }
+
+  get isBrowserMode(): boolean {
+    return this.browserMode;
   }
 
   /**
@@ -216,11 +207,11 @@ export default class TauriLaunchService {
         for (const cap of capsList) {
           (cap as { browserName?: string }).browserName = 'chrome';
           delete (cap as { 'tauri:options'?: unknown })['tauri:options'];
-          // Propagate the resolved URL (a devServer function may have overridden it) to the worker,
-          // which reads devServerUrl from its capability options.
+          // The worker reads mode and devServerUrl from here; a devServer function may have changed the URL.
           const capRecord = cap as Record<string, unknown>;
           capRecord['wdio:tauriServiceOptions'] = {
             ...(capRecord['wdio:tauriServiceOptions'] as Record<string, unknown> | undefined),
+            mode: 'browser',
             devServerUrl,
           };
         }
@@ -230,7 +221,7 @@ export default class TauriLaunchService {
         this.#stopDevServer = undefined;
         throw error instanceof SevereServiceError
           ? error
-          : new SevereServiceError(`Failed to start dev server: ${(error as Error).message}`);
+          : new SevereServiceError(`Failed to start dev server: ${errorMessage(error)}`);
       }
       log.info('Browser mode enabled — skipping driver/binary setup');
       return;
@@ -331,12 +322,11 @@ export default class TauriLaunchService {
     // Uses WDIO's outputDir config option for log file location
     if (mergedOptions.captureBackendLogs || mergedOptions.captureFrontendLogs) {
       try {
-        const { getLogWriter, isLogWriterInitialized } = await import('./logWriter.js');
-        if (isLogWriterInitialized()) {
+        if (isLogWriterInitialized('tauri-service')) {
           log.debug('Log writer already initialized, skipping re-initialization');
         } else {
           const logDir = _config.outputDir || join(process.cwd(), 'logs');
-          getLogWriter().initialize(logDir);
+          getLogWriter('tauri-service').initialize(logDir);
           log.info(`Log capture initialized: ${logDir}`);
         }
       } catch (error) {
@@ -629,7 +619,7 @@ export default class TauriLaunchService {
           log.info(`tauri-driver listening on ${hostname}:${port}`);
         } catch (error) {
           log.error(`Failed to start tauri-driver: ${error}`);
-          throw new SevereServiceError(`Failed to start tauri-driver: ${(error as Error).message}`);
+          throw new SevereServiceError(`Failed to start tauri-driver: ${errorMessage(error)}`);
         }
 
         // Update the capabilities object with hostname and port so WDIO connects to tauri-driver
@@ -1039,71 +1029,70 @@ export default class TauriLaunchService {
   /**
    * Complete service lifecycle
    */
-  async onComplete(_exitCode: number, _config: Options.Testrunner, _capabilities: TauriCapabilities[]): Promise<void> {
+  async onComplete(
+    _exitCode?: number,
+    _config?: Options.Testrunner,
+    _capabilities?: TauriCapabilities[],
+  ): Promise<void> {
     log.debug('Completing Tauri service...');
 
-    await this.#stopDevServer?.();
-    this.#stopDevServer = undefined;
-
     try {
-      const { closeLogWriter } = await import('./logWriter.js');
-      await closeLogWriter();
-    } catch {
-      // Log writer may not have been initialized
-    }
+      await this.#stopDevServer?.();
+      this.#stopDevServer = undefined;
 
-    // Stop all worker test-runner-backends (per-worker mode)
-    if (this.workerBackends.size > 0) {
-      log.info(`Stopping ${this.workerBackends.size} worker test-runner-backend(s)...`);
-      for (const [workerId, backend] of this.workerBackends) {
-        try {
+      if (this.workerBackends.size > 0) {
+        log.info(`Stopping ${this.workerBackends.size} worker test-runner-backend(s)...`);
+        for (const [workerId, backend] of this.workerBackends) {
           await stopTestRunnerBackend(backend.proc);
           log.debug(`Stopped test-runner-backend for worker ${workerId}`);
-        } catch (error) {
-          log.warn(`Failed to stop test-runner-backend for worker ${workerId}: ${error}`);
+        }
+        this.workerBackends.clear();
+      }
+
+      if (this.testRunnerBackend) {
+        await stopTestRunnerBackend(this.testRunnerBackend);
+        this.testRunnerBackend = undefined;
+      }
+
+      const embeddedCleanupErrors: unknown[] = [];
+      if (this.isEmbeddedMode) {
+        log.info(`Stopping ${this.embeddedProcesses.size} embedded driver process(es)...`);
+        for (const [key, process] of this.embeddedProcesses) {
+          try {
+            await stopEmbeddedDriver(process);
+            this.embeddedProcesses.delete(key);
+            log.debug(`Stopped embedded driver: ${key}`);
+          } catch (error) {
+            log.warn(`Failed to stop embedded driver ${key}: ${errorMessage(error)}`);
+            embeddedCleanupErrors.push(error);
+          }
         }
       }
-      this.workerBackends.clear();
-    }
 
-    // Stop shared test-runner-backend (if any)
-    if (this.testRunnerBackend) {
-      await stopTestRunnerBackend(this.testRunnerBackend);
-      this.testRunnerBackend = undefined;
-    }
+      await this.driverPool.stopAll();
+      this.instanceOptions.clear();
+      this.embeddedConfigs.clear();
+      this.portManager.clear();
+      this.backendPortManager.clear();
 
-    const embeddedCleanupErrors: unknown[] = [];
-    // Stop embedded driver processes if using embedded provider
-    if (this.isEmbeddedMode) {
-      log.info(`Stopping ${this.embeddedProcesses.size} embedded driver process(es)...`);
-      for (const [key, process] of this.embeddedProcesses) {
-        try {
-          await stopEmbeddedDriver(process);
-          this.embeddedProcesses.delete(key);
-          log.debug(`Stopped embedded driver: ${key}`);
-        } catch (error) {
-          log.warn(`Failed to stop embedded driver ${key}: ${error}`);
-          embeddedCleanupErrors.push(error);
-        }
+      if (embeddedCleanupErrors.length === 1) {
+        throw embeddedCleanupErrors[0];
+      }
+      if (embeddedCleanupErrors.length > 1) {
+        throw new AggregateError(embeddedCleanupErrors, 'Failed to stop embedded driver processes', {
+          cause: embeddedCleanupErrors[0],
+        });
+      }
+
+      log.debug('Tauri service completed');
+    } finally {
+      // Ensure the stopped processes' shutdown output still reaches the log file.
+      try {
+        await closeLogWriter('tauri-service');
+      } catch {
+        // Log writer may not have been initialized
       }
     }
-
-    await this.driverPool.stopAll();
-    this.instanceOptions.clear();
-    this.embeddedConfigs.clear();
-    this.portManager.clear();
-    this.backendPortManager.clear();
-
-    if (embeddedCleanupErrors.length === 1) {
-      throw embeddedCleanupErrors[0];
-    }
-    if (embeddedCleanupErrors.length > 1) {
-      throw new AggregateError(embeddedCleanupErrors, 'Failed to stop embedded driver processes', {
-        cause: embeddedCleanupErrors[0],
-      });
-    }
-
-    log.debug('Tauri service completed');
   }
 
   /**

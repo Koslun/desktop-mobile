@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 
 import { MultiTargetCdpBridge as CdpBridge } from '@wdio/native-cdp-bridge';
 import type { ElectrobunServiceAPI } from '@wdio/native-types';
-import { createLogger } from '@wdio/native-utils';
+import { createLogger, errorMessage, runBounded } from '@wdio/native-utils';
 
 import { classifyTarget } from './cefClassifier.js';
 import { clearAllMocks, isMockFunction, resetAllMocks, restoreAllMocks } from './commands/allMocks.js';
@@ -16,6 +16,8 @@ import type { ElectrobunServiceOptions } from './types.js';
 import { createWebDriverEvalBridge, installConsoleShim, type WebDriverEvalBridge } from './webdriverEval.js';
 
 const log = createLogger(SERVICE_NAME, 'service');
+
+const CONSOLE_DRAIN_TIMEOUT_MS = 2_000;
 
 /** Parse a `host:port` debuggerAddress into its parts. Defaults the host to localhost. */
 function parseDebuggerAddress(address: string): { host: string; port: number } {
@@ -54,6 +56,12 @@ export default class ElectrobunWorkerService {
     _specs: string[],
     browser: WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser,
   ): Promise<void> {
+    log.info(
+      `before() — mode=${this.options.mode === 'browser' ? 'browser' : 'native'} ` +
+        `multiremote=${browser.isMultiremote} ` +
+        `instances=${browser.isMultiremote ? (browser as WebdriverIO.MultiRemoteBrowser).instances.join(',') : 'n/a'}`,
+    );
+
     // Browser mode: the frontend runs in a plain Chrome session against a dev
     // server — no CEF, no CDP side-channel. The electrobun surface is not
     // installed (execute/mock have no in-app target to drive). Keyed on `mode`,
@@ -68,8 +76,16 @@ export default class ElectrobunWorkerService {
       const mrBrowser = browser as WebdriverIO.MultiRemoteBrowser;
       for (const instanceName of mrBrowser.instances) {
         const instance = mrBrowser.getInstance(instanceName);
-        await this.attachInstance(instance, capabilityFor(capabilities, instanceName));
+        // Prefer the instance's own negotiated caps (which carry the launcher's per-instance
+        // debuggerAddress / webkitgtk binary) over the `before` capabilities argument — the sibling
+        // services (electron/tauri/dioxus) ignore that argument for multiremote. Fall back to it if
+        // the instance exposes no requestedCapabilities.
+        const caps = instanceCapabilities(instance) ?? capabilityFor(capabilities, instanceName);
+        await this.attachInstance(instance, caps);
       }
+      // Root fan-out isn't wired yet — install a guided-error stub so `browser.electrobun.*` on the
+      // multiremote root fails with direction to per-instance access, not a raw TypeError.
+      installRootMultiremoteGuard(mrBrowser);
       return;
     }
 
@@ -128,7 +144,7 @@ export default class ElectrobunWorkerService {
         const summary = raw.map((t) => ({ type: t.type, url: t.url, title: t.title }));
         log.warn(`CDP bridge connect failed at ${host}:${port}; raw /json targets: ${JSON.stringify(summary)}`);
       } catch (probeError) {
-        log.warn(`CDP bridge connect failed; /json probe also failed: ${(probeError as Error).message}`);
+        log.warn(`CDP bridge connect failed; /json probe also failed: ${errorMessage(probeError)}`);
       }
       throw error;
     }
@@ -159,8 +175,7 @@ export default class ElectrobunWorkerService {
   }
 
   async afterSession(): Promise<void> {
-    await this.closeBridges();
-    this.reapW3CApps();
+    await this.after();
   }
 
   /**
@@ -194,13 +209,18 @@ export default class ElectrobunWorkerService {
   }
 
   private async closeBridges(): Promise<void> {
-    for (const drain of this.consoleDrains) {
-      await drain().catch(() => {});
-    }
+    // Bounded and in parallel, so a hung app can't stop after() from killing the Linux app processes.
+    await Promise.all(
+      this.consoleDrains.map((drain) =>
+        runBounded(drain, CONSOLE_DRAIN_TIMEOUT_MS, () =>
+          log.warn('Console log drain timed out; the final console output may be missing'),
+        ).catch(() => {}),
+      ),
+    );
     this.consoleDrains = [];
     for (const bridge of this.bridges) {
-      await bridge.close().catch((error: Error) => {
-        log.warn(`Failed to close CDP bridge: ${error.message}`);
+      await bridge.close().catch((error: unknown) => {
+        log.warn(`Failed to close CDP bridge: ${errorMessage(error)}`);
       });
     }
     this.bridges = [];
@@ -218,6 +238,53 @@ function capabilityFor(capabilities: unknown, instanceName: string): unknown {
     return entry?.capabilities ?? entry ?? capabilities;
   }
   return capabilities;
+}
+
+/**
+ * The caps a multiremote instance's session was created with. Preferred over the `before` hook's
+ * capabilities argument (which electron/tauri/dioxus ignore for multiremote) because it reflects the
+ * launcher's per-instance mutations — the CDP `debuggerAddress`, or the WebKitGTK
+ * `webkitgtk:browserOptions.binary`. Unwraps a W3C `alwaysMatch` envelope; returns undefined when the
+ * instance exposes no requestedCapabilities so the caller can fall back.
+ */
+function instanceCapabilities(instance: WebdriverIO.Browser): unknown {
+  const requested = (instance as { requestedCapabilities?: unknown }).requestedCapabilities;
+  if (requested && typeof requested === 'object' && 'alwaysMatch' in requested) {
+    return (requested as { alwaysMatch?: unknown }).alwaysMatch;
+  }
+  return requested;
+}
+
+/**
+ * Install a root-browser `electrobun` stub for a multiremote run. Root fan-out (one call → every
+ * instance, as electron/tauri/dioxus expose) isn't wired yet, so rather than leave
+ * `browser.electrobun` undefined — a raw `TypeError` on first access — every method throws a guided
+ * error pointing at per-instance access. Converging electrobun onto a real root API is tracked in
+ * https://github.com/webdriverio/desktop-mobile/issues/656
+ */
+function installRootMultiremoteGuard(mrBrowser: WebdriverIO.MultiRemoteBrowser): void {
+  const methods: ReadonlyArray<keyof ElectrobunServiceAPI> = [
+    'execute',
+    'switchWindow',
+    'listWindows',
+    'mock',
+    'isMockFunction',
+    'clearAllMocks',
+    'resetAllMocks',
+    'restoreAllMocks',
+    'triggerDeeplink',
+  ];
+  const guard = {} as Record<string, () => never>;
+  for (const method of methods) {
+    guard[method] = () => {
+      throw new Error(
+        `browser.electrobun.${method}() is not available on the multiremote root browser — address ` +
+          `each instance individually, e.g. browser.getInstance('<name>').electrobun.${method}(...). ` +
+          'Root fan-out is tracked in https://github.com/webdriverio/desktop-mobile/issues/656.',
+      );
+    };
+  }
+  (mrBrowser as unknown as { electrobun: ElectrobunServiceAPI }).electrobun = guard as unknown as ElectrobunServiceAPI;
 }
 
 /**
@@ -258,7 +325,7 @@ async function syncWebDriverWindow(browser: WebdriverIO.Browser, bridge: CdpBrid
     }
     log.warn('No non-blank content window found; element commands may target a blank document.');
   } catch (error) {
-    log.warn(`Could not sync the WebDriver window to the active target: ${(error as Error).message}`);
+    log.warn(`Could not sync the WebDriver window to the active target: ${errorMessage(error)}`);
   }
 }
 

@@ -9,11 +9,15 @@ import {
   probeDevServerReachable,
   startManagedDevServer,
 } from '@wdio/native-core';
-import { createLogger, isErr } from '@wdio/native-utils';
+import { createLogger, errorMessage, isErr } from '@wdio/native-utils';
 import type { Options } from '@wdio/types';
 import { SevereServiceError } from 'webdriverio';
 
-import { linuxExternalProviderUnsupported, macosExternalProviderUnsupported } from './errors.js';
+import {
+  linuxExternalProviderUnsupported,
+  macosExternalProviderUnsupported,
+  windowsExternalProviderUnsupported,
+} from './errors.js';
 import {
   type EmbeddedDriverInfo,
   getEmbeddedPort,
@@ -29,6 +33,7 @@ export default class DioxusLaunchService extends BaseLauncher {
   // Teardown for a service-managed dev server (browser mode). Called from onComplete AND on an
   // onPrepare failure — WDIO does not call onComplete after onPrepare throws. Idempotent.
   #stopDevServer?: () => Promise<void>;
+  #browserMode = false;
 
   constructor(
     private options: DioxusServiceGlobalOptions,
@@ -42,6 +47,10 @@ export default class DioxusLaunchService extends BaseLauncher {
     log.debug('DioxusLaunchService initialised');
     log.debug('Capabilities:', JSON.stringify(capabilities, null, 2));
     log.debug('Config:', JSON.stringify(config, null, 2));
+  }
+
+  get isBrowserMode(): boolean {
+    return this.#browserMode;
   }
 
   async onPrepare(
@@ -105,14 +114,15 @@ export default class DioxusLaunchService extends BaseLauncher {
             throw new SevereServiceError(reachable.error.message);
           }
         }
+        this.#browserMode = true;
         for (const cap of capsList) {
           (cap as { browserName?: string }).browserName = 'chrome';
           delete (cap as { 'dioxus:options'?: unknown })['dioxus:options'];
-          // Propagate the resolved URL (a devServer function may have overridden it) to the worker,
-          // which reads devServerUrl from its capability options.
+          // The worker reads mode and devServerUrl from here; a devServer function may have changed the URL.
           const capRecord = cap as Record<string, unknown>;
           capRecord['wdio:dioxusServiceOptions'] = {
             ...(capRecord['wdio:dioxusServiceOptions'] as Record<string, unknown> | undefined),
+            mode: 'browser',
             devServerUrl,
           };
         }
@@ -122,7 +132,7 @@ export default class DioxusLaunchService extends BaseLauncher {
         this.#stopDevServer = undefined;
         throw error instanceof SevereServiceError
           ? error
-          : new SevereServiceError(`Failed to start dev server: ${(error as Error).message}`);
+          : new SevereServiceError(`Failed to start dev server: ${errorMessage(error)}`);
       }
       log.info('Browser mode enabled — skipping driver/binary setup');
       return;
@@ -133,6 +143,7 @@ export default class DioxusLaunchService extends BaseLauncher {
     if (provider === 'external') {
       if (process.platform === 'linux') throw linuxExternalProviderUnsupported();
       if (process.platform === 'darwin') throw macosExternalProviderUnsupported();
+      throw windowsExternalProviderUnsupported();
     }
 
     log.info(`Dioxus service onPrepare — provider: ${provider}, platform: ${process.platform}`);
@@ -156,44 +167,46 @@ export default class DioxusLaunchService extends BaseLauncher {
         await this.prepareEmbedded(capabilities as DioxusCapabilities[]);
       }
     }
-    // provider === 'external': wdio-dioxus-driver spawning wired in a follow-on commit
   }
 
   private async prepareEmbedded(capsList: DioxusCapabilities[]): Promise<void> {
     const hostname = '127.0.0.1';
 
     for (let i = 0; i < capsList.length; i++) {
-      const cap = capsList[i];
-      const instanceOptions = mergeOptions(this.options, cap['wdio:dioxusServiceOptions']);
-      const capPort = cap['wdio:dioxusServiceOptions']?.embeddedPort;
-      const embeddedPort = capPort != null ? capPort : getEmbeddedPort(instanceOptions) + i;
-      const appBinaryPath = cap['dioxus:options']?.application ?? instanceOptions.appBinaryPath;
-
-      if (!appBinaryPath) {
-        throw new SevereServiceError(
-          'Dioxus application path not specified. ' +
-            "Set 'dioxus:options'.application or appBinaryPath in wdio:dioxusServiceOptions.",
-        );
-      }
-
-      const instanceId = String(i);
-      log.info(`Starting embedded WebDriver for instance ${instanceId} on port ${embeddedPort}`);
-
+      // WDIO does not call onComplete after an onPrepare throw, so reap already-spawned drivers in
+      // the catch — otherwise a later instance's failure orphans the earlier ones.
       try {
+        const cap = capsList[i];
+        const instanceOptions = mergeOptions(this.options, cap['wdio:dioxusServiceOptions']);
+        const capPort = cap['wdio:dioxusServiceOptions']?.embeddedPort;
+        const embeddedPort = capPort != null ? capPort : getEmbeddedPort(instanceOptions) + i;
+        const appBinaryPath = cap['dioxus:options']?.application ?? instanceOptions.appBinaryPath;
+
+        if (!appBinaryPath) {
+          throw new SevereServiceError(
+            'Dioxus application path not specified. ' +
+              "Set 'dioxus:options'.application or appBinaryPath in wdio:dioxusServiceOptions.",
+          );
+        }
+
+        const instanceId = String(i);
+        log.info(`Starting embedded WebDriver for instance ${instanceId} on port ${embeddedPort}`);
+
         const driverInfo = await startEmbeddedDriver(appBinaryPath, embeddedPort, instanceOptions, instanceId);
         this.embeddedProcesses.set(instanceId, driverInfo);
+
+        // Set on the capability itself — wdio run strips these before the W3C session request;
+        // standalone session.ts removes them from the cloned capabilities before remote().
+        (cap as { port?: number; hostname?: string }).port = embeddedPort;
+        (cap as { port?: number; hostname?: string }).hostname = hostname;
+        applyWindowLabel(cap, instanceOptions);
+        log.info(`Embedded WebDriver connection set on capabilities[${i}]: ${hostname}:${embeddedPort}`);
       } catch (error) {
         await this.stopAllEmbedded();
-        throw new SevereServiceError(
-          `Failed to start embedded WebDriver for instance ${instanceId}: ${(error as Error).message}`,
-        );
+        throw error instanceof SevereServiceError
+          ? error
+          : new SevereServiceError(`Failed to start embedded WebDriver for instance ${i}: ${errorMessage(error)}`);
       }
-
-      // Set on the capability itself — wdio run strips these before the W3C session request;
-      // standalone session.ts removes them from the cloned capabilities before remote().
-      (cap as { port?: number; hostname?: string }).port = embeddedPort;
-      (cap as { port?: number; hostname?: string }).hostname = hostname;
-      log.info(`Embedded WebDriver connection set on capabilities[${i}]: ${hostname}:${embeddedPort}`);
     }
   }
 
@@ -205,36 +218,40 @@ export default class DioxusLaunchService extends BaseLauncher {
 
     for (let i = 0; i < entries.length; i++) {
       const [key, instanceConfig] = entries[i];
-      const cap = instanceConfig.capabilities;
-      const instanceOptions = mergeOptions(this.options, cap['wdio:dioxusServiceOptions']);
-      const capPort = cap['wdio:dioxusServiceOptions']?.embeddedPort;
-      const embeddedPort = capPort != null ? capPort : getEmbeddedPort(instanceOptions) + i;
-      const appBinaryPath = cap['dioxus:options']?.application ?? instanceOptions.appBinaryPath;
-
-      if (!appBinaryPath) {
-        throw new SevereServiceError(
-          `Dioxus application path not specified for multiremote instance "${key}". ` +
-            "Set 'dioxus:options'.application or appBinaryPath in wdio:dioxusServiceOptions.",
-        );
-      }
-
-      log.info(`Starting embedded WebDriver for multiremote instance "${key}" on port ${embeddedPort}`);
-
+      // Reap already-spawned drivers on a mid-loop throw (see prepareEmbedded).
       try {
+        const cap = instanceConfig.capabilities;
+        const instanceOptions = mergeOptions(this.options, cap['wdio:dioxusServiceOptions']);
+        const capPort = cap['wdio:dioxusServiceOptions']?.embeddedPort;
+        const embeddedPort = capPort != null ? capPort : getEmbeddedPort(instanceOptions) + i;
+        const appBinaryPath = cap['dioxus:options']?.application ?? instanceOptions.appBinaryPath;
+
+        if (!appBinaryPath) {
+          throw new SevereServiceError(
+            `Dioxus application path not specified for multiremote instance "${key}". ` +
+              "Set 'dioxus:options'.application or appBinaryPath in wdio:dioxusServiceOptions.",
+          );
+        }
+
+        log.info(`Starting embedded WebDriver for multiremote instance "${key}" on port ${embeddedPort}`);
+
         const driverInfo = await startEmbeddedDriver(appBinaryPath, embeddedPort, instanceOptions, key);
         this.embeddedProcesses.set(key, driverInfo);
+
+        // For multiremote, port/hostname must be on the outer instance config so WDIO
+        // reads them as connection parameters, not as W3C capability keys.
+        (instanceConfig as { port?: number; hostname?: string }).port = embeddedPort;
+        (instanceConfig as { port?: number; hostname?: string }).hostname = hostname;
+        applyWindowLabel(cap, instanceOptions);
+        log.info(`Embedded WebDriver connection set for "${key}": ${hostname}:${embeddedPort}`);
       } catch (error) {
         await this.stopAllEmbedded();
-        throw new SevereServiceError(
-          `Failed to start embedded WebDriver for multiremote instance "${key}": ${(error as Error).message}`,
-        );
+        throw error instanceof SevereServiceError
+          ? error
+          : new SevereServiceError(
+              `Failed to start embedded WebDriver for multiremote instance "${key}": ${errorMessage(error)}`,
+            );
       }
-
-      // For multiremote, port/hostname must be on the outer instance config so WDIO
-      // reads them as connection parameters, not as W3C capability keys.
-      (instanceConfig as { port?: number; hostname?: string }).port = embeddedPort;
-      (instanceConfig as { port?: number; hostname?: string }).hostname = hostname;
-      log.info(`Embedded WebDriver connection set for "${key}": ${hostname}:${embeddedPort}`);
     }
   }
 
@@ -242,25 +259,24 @@ export default class DioxusLaunchService extends BaseLauncher {
     for (const [id, info] of this.embeddedProcesses) {
       log.info(`Stopping embedded driver instance ${id}`);
       await stopEmbeddedDriver(info).catch((err) => {
-        log.warn(`Error stopping embedded driver ${id}: ${(err as Error).message}`);
+        log.warn(`Error stopping embedded driver ${id}: ${errorMessage(err)}`);
       });
     }
     this.embeddedProcesses.clear();
   }
 
   async onComplete(): Promise<void> {
-    await this.#stopDevServer?.();
-    this.#stopDevServer = undefined;
-    await this.stopAllEmbedded();
-    // Stop any external (wdio-dioxus-driver) processes managed by BaseLauncher
-    await this.stopAllDrivers();
-    // Flush + close the LogWriter (mirrors tauri-service/launcher.ts). Without
-    // this, bytes still in the WriteStream buffer at process exit can be
-    // silently dropped from the captured log file.
     try {
-      await closeLogWriter('dioxus-service');
-    } catch (error) {
-      log.warn(`Failed to close LogWriter: ${(error as Error).message}`);
+      await this.#stopDevServer?.();
+      this.#stopDevServer = undefined;
+      await this.stopAllEmbedded();
+      await this.stopAllDrivers();
+    } finally {
+      try {
+        await closeLogWriter('dioxus-service');
+      } catch (error) {
+        log.warn(`Failed to close LogWriter: ${errorMessage(error)}`);
+      }
     }
   }
 }
@@ -277,16 +293,28 @@ function normaliseCaps(
   return Object.values(caps).map((v) => v.capabilities);
 }
 
+// The embedded driver reads windowLabel only from the capability.
+function applyWindowLabel(cap: DioxusCapabilities, instanceOptions: DioxusServiceOptions): void {
+  if (instanceOptions.windowLabel === undefined) {
+    return;
+  }
+  cap['wdio:dioxusServiceOptions'] = { ...cap['wdio:dioxusServiceOptions'], windowLabel: instanceOptions.windowLabel };
+}
+
+// Capability options win over global options unless they are undefined.
 function mergeOptions(
   globalOptions: DioxusServiceGlobalOptions,
   capabilityOptions?: DioxusServiceOptions,
 ): DioxusServiceOptions {
+  const definedCapabilityOptions = Object.fromEntries(
+    Object.entries(capabilityOptions ?? {}).filter(([, value]) => value !== undefined),
+  ) as DioxusServiceOptions;
+  const merged: DioxusServiceOptions = { ...globalOptions, ...definedCapabilityOptions };
   return {
-    ...globalOptions,
-    ...capabilityOptions,
-    captureBackendLogs: capabilityOptions?.captureBackendLogs ?? globalOptions.captureBackendLogs ?? false,
-    captureFrontendLogs: capabilityOptions?.captureFrontendLogs ?? globalOptions.captureFrontendLogs ?? false,
-    backendLogLevel: capabilityOptions?.backendLogLevel ?? globalOptions.backendLogLevel ?? 'info',
-    frontendLogLevel: capabilityOptions?.frontendLogLevel ?? globalOptions.frontendLogLevel ?? 'info',
+    ...merged,
+    captureBackendLogs: merged.captureBackendLogs ?? false,
+    captureFrontendLogs: merged.captureFrontendLogs ?? false,
+    backendLogLevel: merged.backendLogLevel ?? 'info',
+    frontendLogLevel: merged.frontendLogLevel ?? 'info',
   };
 }

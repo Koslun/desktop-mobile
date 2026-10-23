@@ -6,8 +6,6 @@ import type { TauriCommandContext, TauriResult } from '../types.js';
 import { getCurrentWindowLabel, getDefaultWindowLabel, getSessionProvider } from '../window.js';
 import { wrapScriptForDirectEval } from '../wrapForDirectEval.js';
 
-export { clearPluginAvailabilityCache } from '../pluginCache.js';
-
 const log = createLogger('tauri-service', 'service');
 
 const directEvalClientCache = new WeakMap<WebdriverIO.Browser, { client: DirectEvalClient; port: number }>();
@@ -19,11 +17,18 @@ function isExecuteOptions(arg: unknown): arg is TauriExecuteOptions {
 const DIRECT_EVAL_PORT_ENV_VAR = 'TAURI_WEBDRIVER_PORT';
 const DIRECT_EVAL_DEFAULT_PORT = 4445;
 
-function getDirectEvalPort(): number {
+function getDirectEvalPort(browser: WebdriverIO.Browser): number {
+  // /wdio/eval is served on the embedded WebDriver port, so the session's own port is authoritative
+  const sessionPort = browser.options.port;
+  if (sessionPort) {
+    return sessionPort;
+  }
   const envPort = process.env[DIRECT_EVAL_PORT_ENV_VAR];
   if (envPort) {
     const port = parseInt(envPort, 10);
-    if (!Number.isNaN(port)) return port;
+    if (!Number.isNaN(port)) {
+      return port;
+    }
   }
   return DIRECT_EVAL_DEFAULT_PORT;
 }
@@ -88,7 +93,7 @@ export async function execute<ReturnValue, InnerArguments extends unknown[] = un
 
   if (provider === 'embedded') {
     const scriptString = typeof script === 'function' ? script.toString() : script;
-    const port = getDirectEvalPort();
+    const port = getDirectEvalPort(browser);
     const client = getOrCreateDirectEvalClient(browser, port);
     const wrapped = wrapScriptForDirectEval(scriptString, JSON.stringify(userArgs));
 

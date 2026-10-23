@@ -13,7 +13,8 @@
  * and parameter properties.
  *
  * Classification (first matching rule wins):
- *   - *.md anywhere            → docs (never triggers pipelines; lint runs unconditionally)
+ *   - *.md anywhere            → docs (never triggers pipelines; lint runs unconditionally),
+ *                                except packages/<pkg>/permissions/** (generated, shipped in the crate)
  *   - packages/native-*, packages/bundler        → shared (all services)
  *   - packages/<svc>[-...]/**                    → that service
  *   - packages/<unrecognised>/**                 → unknown (runs all — convention drift, fail loud)
@@ -63,6 +64,7 @@ const CORE_INFRA_WORKFLOWS = new Set([
 // Meta-workflows that never require service tests.
 const META_WORKFLOWS = new Set([
   'codeql.yml',
+  'crate-drift.yml',
   'pr-title.yml',
   'auto-label-issues.yml',
   'expense.yml',
@@ -169,7 +171,11 @@ function serviceForToken(filename: string, services: string[]): string | undefin
  * Returns: 'none' | 'shared' | 'all' | a service name.
  */
 export function classifyFile(file: string, services: string[]): Verdict {
-  if (file.endsWith('.md')) return 'none';
+  // Generated permission docs ship in the plugin crates, so a change to them must run that service's CI.
+  const isPermissionsFile = /^packages\/[^/]+\/permissions\//.test(file);
+  if (file.endsWith('.md') && !isPermissionsFile) {
+    return 'none';
+  }
 
   const pkg = file.match(/^packages\/([^/]+)\//);
   if (pkg) {
@@ -329,6 +335,6 @@ function main(): void {
   console.log(output.trimEnd());
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.main) {
   main();
 }
