@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -6,9 +7,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, Runtime};
 
-use crate::platform::WindowRect;
+use crate::platform::{apply_window_change, WindowRect};
 use crate::server::response::{WebDriverErrorResponse, WebDriverResponse, WebDriverResult};
 use crate::server::AppState;
+
+/// How long Close Window waits for the window to be destroyed before taking the close as prevented.
+const CLOSE_WINDOW_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 pub struct SwitchWindowRequest {
@@ -73,19 +77,35 @@ pub async fn close_window<R: Runtime>(
     let current_window = session.current_window.clone();
     drop(sessions);
 
-    // Close the current window
-    if let Some(window) = state.app.webview_windows().get(&current_window).cloned() {
-        window
-            .destroy()
-            .map_err(|e| WebDriverErrorResponse::unknown_error(&e.to_string()))?;
+    let Some(window) = state.app.webview_windows().get(&current_window).cloned() else {
+        return Err(WebDriverErrorResponse::no_such_window());
+    };
 
-        // Return remaining window handles
-        let handles: Vec<String> = state.app.webview_windows().keys().cloned().collect();
+    // Unlike destroy(), close() runs the app's CloseRequested handlers, which can prevent it.
+    apply_window_change(
+        &window,
+        "tauri://destroyed",
+        "close the window",
+        CLOSE_WINDOW_TIMEOUT,
+        || window.close(),
+        || state.app.get_webview_window(&current_window).is_none(),
+    )
+    .await?;
 
-        Ok(WebDriverResponse::success(handles))
-    } else {
-        Err(WebDriverErrorResponse::no_such_window())
+    let handles = state.app.webview_windows().into_keys().collect();
+    Ok(WebDriverResponse::success(kept_window_first(
+        handles,
+        &current_window,
+    )))
+}
+
+/// Clients switch to the first handle after Close Window, so a window the app kept stays current.
+fn kept_window_first(mut handles: Vec<String>, closing_label: &str) -> Vec<String> {
+    if let Some(index) = handles.iter().position(|handle| handle == closing_label) {
+        let kept = handles.remove(index);
+        handles.insert(0, kept);
     }
+    handles
 }
 
 /// POST `/session/{session_id}/window` - Switch to window
@@ -247,4 +267,25 @@ pub async fn fullscreen<R: Runtime + 'static>(
         "width": rect.width,
         "height": rect.height
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn a_window_the_app_kept_open_comes_first() {
+        let handles = kept_window_first(labels(&["main", "splash", "editor"]), "editor");
+        assert_eq!(handles, labels(&["editor", "main", "splash"]));
+    }
+
+    #[test]
+    fn a_closed_window_leaves_the_order_unchanged() {
+        let handles = kept_window_first(labels(&["main", "splash"]), "editor");
+        assert_eq!(handles, labels(&["main", "splash"]));
+    }
 }
