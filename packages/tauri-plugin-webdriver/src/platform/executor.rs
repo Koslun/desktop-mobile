@@ -8,6 +8,7 @@ use tauri::{
 };
 
 use crate::platform::alert_state::{AlertStateManager, AlertType};
+use crate::platform::pointer_input::{pointer_event_script, PointerInputState};
 use crate::server::response::WebDriverErrorResponse;
 
 /// Element bounding rectangle
@@ -271,7 +272,6 @@ pub enum PointerEventType {
     Down,
     Up,
     Move,
-    Click,
 }
 
 /// Cookie data
@@ -1351,49 +1351,19 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
         Ok(())
     }
 
-    /// Dispatch a pointer/mouse event
+    /// Dispatch a pointer/mouse event. Returns whether its `pointerdown` was
+    /// canceled (a listener called `preventDefault()`).
     async fn dispatch_pointer_event(
         &self,
         event_type: PointerEventType,
         x: i32,
         y: i32,
         button: u32,
-    ) -> Result<(), WebDriverErrorResponse> {
-        let event_name = match event_type {
-            PointerEventType::Down => "mousedown",
-            PointerEventType::Up => "mouseup",
-            PointerEventType::Move => "mousemove",
-            // Manually dispatched mousedown/mouseup do NOT make the browser
-            // synthesize a click, so element click handlers never fire. The
-            // actions handler emits this explicitly after a same-spot down+up.
-            PointerEventType::Click => "click",
-        };
-
-        let buttons = if matches!(event_type, PointerEventType::Down) {
-            1 << button
-        } else {
-            0
-        };
-        let script = format!(
-            r"(function() {{
-                var el = document.elementFromPoint({x}, {y});
-                if (!el) el = document.body;
-
-                var event = new MouseEvent('{event_name}', {{
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: {x},
-                    clientY: {y},
-                    button: {button},
-                    buttons: {buttons}
-                }});
-                el.dispatchEvent(event);
-                return true;
-            }})()"
-        );
-
-        self.evaluate_js(&script).await?;
-        Ok(())
+        input_state: PointerInputState,
+    ) -> Result<bool, WebDriverErrorResponse> {
+        let script = pointer_event_script(event_type, x, y, button, input_state);
+        let result = self.evaluate_js(&script).await?;
+        extract_bool_value(&result)
     }
 
     /// Dispatch a scroll/wheel event

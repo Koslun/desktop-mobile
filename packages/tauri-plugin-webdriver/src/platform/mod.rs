@@ -4,11 +4,14 @@ pub(crate) mod key_input;
 
 pub use alert_state::AlertStateManager;
 pub use executor::*;
+pub use pointer_input::PointerInputState;
 
 #[cfg(target_os = "windows")]
 pub use windows::AsyncScriptState;
 #[cfg(target_os = "windows")]
 pub use windows::ScriptExecutionLocks;
+
+mod pointer_input;
 
 #[cfg(target_os = "macos")]
 mod macos;
