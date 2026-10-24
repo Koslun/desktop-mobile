@@ -1,16 +1,19 @@
-//! Internal crate used by [`wdio-dioxus-embedded-driver`] to connect a Dioxus
-//! desktop app to [`@wdio/dioxus-service`]. It provides the `wdio://` IPC
-//! channel ([`invoke`]), log forwarding ([`log_bridge`]), the window registry
-//! behind `listWindows` / `switchWindow` ([`window_state`]), automation
-//! detection ([`automation`]) and a deeplink helper ([`deeplink`]).
+//! Internal crate used by [`wdio-dioxus`] and [`wdio-dioxus-embedded-driver`]
+//! to connect a Dioxus desktop app to [`@wdio/dioxus-service`]. It provides
+//! the `wdio://` IPC channel ([`invoke`]), log forwarding ([`log_bridge`]),
+//! the window registry behind `listWindows` / `switchWindow`
+//! ([`window_state`]), automation detection ([`automation`]) and a deeplink
+//! helper ([`deeplink`]).
 //!
 //! [`install`] registers each window from a [`Config::with_on_window`]
 //! callback. Dioxus keeps only one, so a later `with_on_window` call replaces
 //! the bridge's; an app that needs its own callback must call
-//! [`window_state::register_window`] from it, and, under the embedded driver,
-//! [`webview::attach`] with the returned label and the callback's `VirtualDom`.
+//! `wdio_dioxus::on_window` from it. That hook registers the window, but
+//! does not call [`webview::attach`], which the embedded driver needs for
+//! screenshots.
 //!
 //! [`@wdio/dioxus-service`]: https://www.npmjs.com/package/@wdio/dioxus-service
+//! [`wdio-dioxus`]: https://docs.rs/wdio-dioxus
 //! [`wdio-dioxus-embedded-driver`]: https://docs.rs/wdio-dioxus-embedded-driver
 
 pub mod automation;
@@ -26,6 +29,10 @@ use serde_json::{json, Value};
 
 pub use invoke::CommandRegistry;
 pub use log_bridge::FRONTEND_MARKER;
+
+/// Mirrors `wdio_dioxus_embedded_driver::PORT_ENV_VAR`, which this crate can't
+/// import: the embedded driver depends on the bridge.
+const EMBEDDED_PORT_ENV_VAR: &str = "WDIO_EMBEDDED_PORT";
 
 /// The guest-js bundle, embedded by `build.rs` from `dist-js/index.js`. It's
 /// committed so crates.io and git builds have it; rebuild it with
@@ -71,6 +78,14 @@ fn install_with_registry_and_config(
   embedded_port: Option<u16>,
 ) -> Config {
   automation::report();
+  if embedded_port.is_none() && std::env::var_os(EMBEDDED_PORT_ENV_VAR).is_some() {
+    tracing::warn!(
+      target: "wdio_dioxus_bridge",
+      "{EMBEDDED_PORT_ENV_VAR} is set, so @wdio/dioxus-service is waiting for an embedded WebDriver \
+       server, but none was started. Add wdio-dioxus with its default features and call \
+       wdio_dioxus::install(config)."
+    );
+  }
   log_bridge::register(&registry);
   register_window_commands(&registry);
   if embedded_port.is_some() {
