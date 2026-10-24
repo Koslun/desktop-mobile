@@ -174,9 +174,12 @@ export async function createMock(command: string, browserContext?: WebdriverIO.B
   };
 
   mock.mockRestore = async () => {
-    await tauriExecute<void>(browserToUse, interceptor.buildUnregistrationScript(command));
-    outerMockClear();
-    mockStore.deleteMock(`tauri.${command}`);
+    try {
+      await tauriExecute<void>(browserToUse, interceptor.buildUnregistrationScript(command));
+    } finally {
+      outerMockClear();
+      mockStore.deleteMock(`tauri.${command}`);
+    }
     return mock;
   };
 
@@ -345,9 +348,12 @@ async function createBrowserModeMock(command: string, browser: WebdriverIO.Brows
   };
 
   mock.mockRestore = async () => {
-    await runInterceptorScript<void>(browser, interceptor.buildUnregistrationScript(command));
-    outerMockClear();
-    mockStore.deleteMock(`tauri.${command}`);
+    try {
+      await runInterceptorScript<void>(browser, interceptor.buildUnregistrationScript(command));
+    } finally {
+      outerMockClear();
+      mockStore.deleteMock(`tauri.${command}`);
+    }
     return mock;
   };
 
