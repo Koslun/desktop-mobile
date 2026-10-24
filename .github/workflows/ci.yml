@@ -1240,9 +1240,13 @@ jobs:
       contents: read
       statuses: write
     needs:
+      # If one of these fails, its dependents are skipped, not failed, so it has to be gated itself.
+      - detect-changes
+      - build
       - lint
       - unit-matrix
       - browser-mode
+      - setup-automation-smoke
       - e2e-matrix
       - e2e-electron-window
       - e2e-tauri-linux
