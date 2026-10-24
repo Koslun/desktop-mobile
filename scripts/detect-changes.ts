@@ -27,6 +27,9 @@
  *   - biome.jsonc, eslint.config.js → none (the lint job has no `if:` gate)
  *   - everything else (docs/, .claude/, dotfiles…) → none
  *
+ * A releasekit release commit (RELEASE_COMMIT=true) runs lint only: it bumps versions, changelogs
+ * and Cargo locks, and its publish doesn't wait for CI.
+ *
  * 'all' and 'unknown' both run every pipeline; they differ only in reporting —
  * 'unknown' marks files no convention rule could place (likely naming drift) and is
  * called out separately in the step summary. Silent under-running is the failure
@@ -49,7 +52,7 @@ interface Classification {
   perFile: Array<{ file: string; verdict: Verdict }>;
 }
 
-// Core CI orchestration + release workflows: changes affect every service pipeline.
+// Core CI orchestration: changes affect every service pipeline.
 const CORE_INFRA_WORKFLOWS = new Set([
   'ci.yml',
   '_ci-detect-changes.reusable.yml',
@@ -57,18 +60,21 @@ const CORE_INFRA_WORKFLOWS = new Set([
   '_ci-lint.reusable.yml',
   '_ci-unit.reusable.yml',
   '_ci-package.reusable.yml',
-  'release.yml',
-  '_release.reusable.yml',
 ]);
 
-// Meta-workflows that never require service tests.
+// Workflows the service tests can't exercise, so a change to one needs only the lint job (which runs actionlint).
 const META_WORKFLOWS = new Set([
   'codeql.yml',
   'crate-drift.yml',
   'pr-title.yml',
   'auto-label-issues.yml',
   'expense.yml',
+  'release.yml',
+  '_release.reusable.yml',
+  'standing-pr.yml',
+  '_standing-pr-update.reusable.yml',
   'release-preview.yml',
+  'release-preview-comment.yml',
 ]);
 
 // Workspace / dependency / build / test configuration at the repo root.
@@ -236,7 +242,7 @@ function affectedServices(dir: string, services: string[], dependents: Record<st
 export function classifyChanges(
   files: string[],
   services: string[],
-  { forceAll = false, dependents = {} as Record<string, string[]> } = {},
+  { forceAll = false, releaseCommit = false, dependents = {} as Record<string, string[]> } = {},
 ): Classification {
   const runs: Record<string, boolean> = Object.fromEntries(services.map((svc) => [svc, false]));
   let sharedChanges = false;
@@ -250,6 +256,10 @@ export function classifyChanges(
   if (forceAll) {
     for (const svc of services) runs[svc] = true;
     return { runs, sharedChanges: true, lintOnly: false, triggersAll, unknownFiles, sharedDetail, perFile: [] };
+  }
+
+  if (releaseCommit) {
+    return { runs, sharedChanges: false, lintOnly: true, triggersAll, unknownFiles, sharedDetail, perFile: [] };
   }
 
   const perFile: Array<{ file: string; verdict: Verdict }> = [];
@@ -289,13 +299,14 @@ function appendFile(envVar: string, content: string): void {
 function main(): void {
   const files: string[] = JSON.parse(process.env.CHANGED_FILES || '[]');
   const forceAll = process.env.FORCE_ALL === 'true';
+  const releaseCommit = process.env.RELEASE_COMMIT === 'true';
   const services = discoverServices(process.cwd());
   const dependents = buildServiceDependents(process.cwd(), services);
 
   const { runs, sharedChanges, lintOnly, triggersAll, unknownFiles, sharedDetail, perFile } = classifyChanges(
     files,
     services,
-    { forceAll, dependents },
+    { forceAll, releaseCommit, dependents },
   );
 
   let output = '';
@@ -307,6 +318,7 @@ function main(): void {
 
   let summary = '## Change Detection Summary\n\n';
   summary += forceAll ? '**Force-all mode** — running everything.\n\n' : '';
+  summary += releaseCommit && !forceAll ? '**Release commit** — lint only.\n\n' : '';
   summary += '| Service | Run |\n|---------|-----|\n';
   for (const [svc, run] of Object.entries(runs)) summary += `| ${svc} | ${run} |\n`;
   summary += `\n- Shared package changes: ${sharedChanges}\n- Lint only: ${lintOnly}\n`;
