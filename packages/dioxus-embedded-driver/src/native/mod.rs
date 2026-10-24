@@ -40,13 +40,18 @@ pub async fn screenshot(label: &str, timeout: Duration) -> Result<String, WebDri
   match tokio::time::timeout(timeout, rx).await {
     Ok(Ok(Ok(png_base64))) => Ok(png_base64),
     Ok(Ok(Err(message))) => Err(WebDriverErrorResponse::unknown_error(&message)),
-    Ok(Err(_)) => Err(WebDriverErrorResponse::unknown_error("the webview dropped the screenshot request")),
+    Ok(Err(_)) => {
+      Err(WebDriverErrorResponse::unknown_error("the webview dropped the screenshot request"))
+    }
     Err(_) => Err(WebDriverErrorResponse::script_timeout()),
   }
 }
 
 /// A 1×1 transparent PNG, returned where native capture isn't wired yet.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub async fn screenshot(_label: &str, _timeout: Duration) -> Result<String, WebDriverErrorResponse> {
+pub async fn screenshot(
+  _label: &str,
+  _timeout: Duration,
+) -> Result<String, WebDriverErrorResponse> {
   Ok("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string())
 }
