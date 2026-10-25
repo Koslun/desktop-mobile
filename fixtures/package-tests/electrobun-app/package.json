@@ -20,6 +20,6 @@
     "@wdio/mocha-framework": "^10.1.0",
     "@wdio/native-types": "workspace:*",
     "@wdio/spec-reporter": "^10.1.0",
-    "typescript": "7.0.2"
+    "typescript": "6.0.3"
   }
 }
