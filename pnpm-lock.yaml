@@ -173,6 +173,9 @@ catalogs:
     '@wdio/cli':
       specifier: 10.1.0
       version: 10.1.0
+    '@wdio/display-server':
+      specifier: 10.1.0
+      version: 10.1.0
     '@wdio/globals':
       specifier: 10.1.0
       version: 10.1.0
@@ -191,9 +194,6 @@ catalogs:
     '@wdio/visual-service':
       specifier: 11.0.0
       version: 11.0.0
-    '@wdio/xvfb':
-      specifier: 9.32.0
-      version: 9.32.0
     electron:
       specifier: 45.0.0
       version: 45.0.0
@@ -289,6 +289,9 @@ importers:
       '@wdio/dioxus-service':
         specifier: link:../packages/dioxus-service
         version: link:../packages/dioxus-service
+      '@wdio/display-server':
+        specifier: catalog:default
+        version: 10.1.0
       '@wdio/electrobun-service':
         specifier: link:../packages/electrobun-service
         version: link:../packages/electrobun-service
@@ -319,9 +322,6 @@ importers:
       '@wdio/visual-service':
         specifier: catalog:default
         version: 11.0.0(expect-webdriverio@8.0.0(@wdio/types@10.1.0)(webdriverio@10.1.0(bufferutil@4.1.0)(puppeteer-core@25.16.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)(yauzl@3.4.0))(supports-color@8.1.1)(utf-8-validate@6.0.6)(yauzl@3.4.0)))(webdriverio@10.1.0(bufferutil@4.1.0)(puppeteer-core@25.16.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)(yauzl@3.4.0))(supports-color@8.1.1)(utf-8-validate@6.0.6)(yauzl@3.4.0))
-      '@wdio/xvfb':
-        specifier: catalog:default
-        version: 9.32.0
       electron:
         specifier: catalog:default
         version: 45.0.0(supports-color@8.1.1)
@@ -3994,10 +3994,6 @@ packages:
     resolution: {integrity: sha512-zZn9TMaxzTAHOGX5fLTs9E8Gw436l6xSFh+wZyXfRpgnzgeS5W/U0I6pBAjsvMn8rr5HAJC8Vy+WhiUxmbKsvQ==}
     engines: {node: '>=22.19.0'}
 
-  '@wdio/logger@9.29.1':
-    resolution: {integrity: sha512-0ZAEIo6PNyMIJPlOGkIgyOJUjcd0pC8/QHlVAAe1c91/IcjZ1X+k0yidXHaboJdN7dq1XPUacmhRdtua0U5EZg==}
-    engines: {node: '>=18.20.0'}
-
   '@wdio/mocha-framework@10.1.0':
     resolution: {integrity: sha512-KmdqVqMEc415ish7OnSaOYDr/wMBgxu5jqQ4s3aYwc5zsejeseBoUE5/6EmEBIOZk6nAtij3GkIQ6QeL6TRihw==}
     engines: {node: '>=22.19.0'}
@@ -4064,10 +4060,6 @@ packages:
     engines: {node: '>=22.19.0'}
     peerDependencies:
       webdriverio: ^10.0.0
-
-  '@wdio/xvfb@9.32.0':
-    resolution: {integrity: sha512-K1DL05PngTMKY8mkzMNYpKNqZNPTrdJheuvTeWwwYlm4Yn9hLc8V3hw6EDsuEYw4cyEyiVeukLbLOEW+AhvqVw==}
-    engines: {node: '>=18.20.0'}
 
   '@xmldom/xmldom@0.8.13':
     resolution: {integrity: sha512-KRYzxepc14G/CEpEGc3Yn+JKaAeT63smlDr+vjB8jRfgTBBI9wRj/nkQEO+ucV8p8I9bfKLWp37uHgFrbntPvw==}
@@ -10054,14 +10046,6 @@ snapshots:
       safe-regex2: 5.1.1
       strip-ansi: 7.2.0
 
-  '@wdio/logger@9.29.1':
-    dependencies:
-      chalk: 5.6.2
-      loglevel: 1.9.2
-      loglevel-plugin-prefix: 0.8.4
-      safe-regex2: 5.1.1
-      strip-ansi: 7.2.0
-
   '@wdio/mocha-framework@10.1.0(supports-color@8.1.1)(yauzl@3.4.0)':
     dependencies:
       '@types/mocha': 10.0.10
@@ -10213,10 +10197,6 @@ snapshots:
       webdriverio: 10.1.0(bufferutil@4.1.0)(puppeteer-core@25.16.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)(yauzl@3.4.0))(supports-color@8.1.1)(utf-8-validate@6.0.6)(yauzl@3.4.0)
     transitivePeerDependencies:
       - expect-webdriverio
-
-  '@wdio/xvfb@9.32.0':
-    dependencies:
-      '@wdio/logger': 9.29.1
 
   '@xmldom/xmldom@0.8.13': {}
 
