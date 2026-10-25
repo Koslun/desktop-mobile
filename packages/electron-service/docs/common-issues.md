@@ -70,6 +70,14 @@ npm run build                       # for production
 
 See: [Electron Fuses Documentation](https://www.electronjs.org/docs/latest/tutorial/fuses#nodecliinspect)
 
+## CDP bridge could not connect to the main process
+
+The `EnableNodeCliInspectArguments` fuse is enabled, but the service could not reach the app's Node inspector. The service logs the connection error when the session starts, and every `browser.electron` call that needs the bridge throws it, with a message starting `CDP bridge could not connect to the main process, API is disabled:`. Main process log capture is off for that session. Tests that don't use those APIs still run.
+
+Check that:
+- The app is still running after it starts. If it exits or crashes during startup, its inspector goes with it.
+- The inspector has time to start. On a slow machine, raise [`cdpBridgeRetryCount`](./configuration.md#cdpbridgeretrycount) or [`cdpBridgeWaitInterval`](./configuration.md#cdpbridgewaitinterval).
+
 ## DevToolsActivePort file doesn't exist
 
 This is a Chromium error which may appear when using Docker or CI. Most of the "fixes" discussed online are based around passing different combinations of args to Chromium - you can set these via [`appArgs`](./configuration.md#appargs), though in most cases running under a virtual display such as Xvfb has proven more effective.

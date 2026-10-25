@@ -115,7 +115,7 @@ export class DevTool {
           });
 
           req.on('error', (error) => {
-            reject(new Error(`Request Error: ${error.message}`));
+            reject(new Error(`Request Error: ${requestErrorDetail(error)}`, { cause: error }));
           });
 
           req.end();
@@ -132,6 +132,15 @@ export class DevTool {
     log.trace(message);
     reject(new Error(message));
   }
+}
+
+// When every address for a host such as localhost refuses the connection, Node throws an
+// AggregateError with an empty message; its inner errors name each address.
+function requestErrorDetail(error: Error): string {
+  if (error.message || !(error instanceof AggregateError)) {
+    return error.message;
+  }
+  return error.errors.map((inner) => (inner instanceof Error ? inner.message : String(inner))).join('; ');
 }
 
 const getReqInfo = (request: ClientRequest) =>

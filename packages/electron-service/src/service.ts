@@ -10,6 +10,7 @@ import type {
   ElectronServiceGlobalOptions,
   ElectronType,
   ExecuteOpts,
+  Result,
 } from '@wdio/native-types';
 import {
   createLogger,
@@ -397,7 +398,8 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
 
       stage = 'initCdpBridge:root';
       log.info('Initialising CDP bridge...');
-      const cdpBridge = isMultiremote(this.browser) ? undefined : await initCdpBridge(this.cdpOptions, capabilities);
+      const bridge = isMultiremote(this.browser) ? NO_BRIDGE : await initCdpBridge(this.cdpOptions, capabilities);
+      const cdpBridge = connectedBridge(bridge);
 
       // Initialize log capture if enabled
       // Note: Renderer logs work via Puppeteer and don't require CDP bridge
@@ -411,7 +413,7 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
        * Add electron API to browser object
        */
       stage = 'getElectronAPI:root';
-      this.browser.electron = getElectronAPI.call(this, this.browser, cdpBridge);
+      this.browser.electron = getElectronAPI.call(this, this.browser, bridge);
 
       const isElectronApiAvailable = (browser: WebdriverIO.Browser, cdpBridge: ElectronCdpBridge | undefined) =>
         browser?.electron && typeof browser.electron.execute === 'function' && cdpBridge !== undefined;
@@ -428,8 +430,7 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
         const mrBrowser = instance;
 
         // Set up electron API for the root multiremote browser
-        // Use the first available instance's CDP bridge, or undefined if none available
-        let rootCdpBridge: ElectronCdpBridge | undefined;
+        let rootBridge = NO_BRIDGE;
 
         for (const instanceName of mrBrowser.instances) {
           const mrInstance = mrBrowser.getInstance(instanceName);
@@ -439,15 +440,12 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
 
           if (caps[CUSTOM_CAPABILITY_NAME]) {
             stage = `initCdpBridge:rootFrom:${instanceName}`;
-            const mrCdpBridge = await initCdpBridge(this.cdpOptions, caps);
-            if (mrCdpBridge && !rootCdpBridge) {
-              rootCdpBridge = mrCdpBridge;
-            }
-            break; // Use the first available CDP bridge for the root
+            rootBridge = await initCdpBridge(this.cdpOptions, caps);
+            break;
           }
         }
 
-        mrBrowser.electron = getElectronAPI.call(this, mrBrowser as unknown as WebdriverIO.Browser, rootCdpBridge);
+        mrBrowser.electron = getElectronAPI.call(this, mrBrowser as unknown as WebdriverIO.Browser, rootBridge);
 
         for (const instance of mrBrowser.instances) {
           const mrInstance = mrBrowser.getInstance(instance);
@@ -461,7 +459,8 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
 
           stage = `initCdpBridge:${instance}`;
           log.info(`Initialising CDP bridge for instance: ${instance}`);
-          const mrCdpBridge = await initCdpBridge(this.cdpOptions, caps);
+          const mrBridge = await initCdpBridge(this.cdpOptions, caps);
+          const mrCdpBridge = connectedBridge(mrBridge);
 
           // Initialize log capture for this multiremote instance
           // Check if this specific instance has logging enabled
@@ -473,7 +472,7 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
             await this.initializeLogCapture(mrCdpBridge, mrInstance, instance, caps);
           }
 
-          mrInstance.electron = getElectronAPI.call(this, mrInstance, mrCdpBridge);
+          mrInstance.electron = getElectronAPI.call(this, mrInstance, mrBridge);
 
           stage = `getPuppeteer:${instance}`;
           const mrPuppeteer = await getPuppeteer(mrInstance);
@@ -845,10 +844,7 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
         if (cdpBridge) {
           await this.logCaptureManager.captureMainProcessLogs(cdpBridge, logOptions, instanceId);
         } else {
-          log.warn(
-            'Main process log capture requested but CDP bridge is unavailable. ' +
-              'This may be due to EnableNodeCliInspectArguments fuse being disabled.',
-          );
+          log.warn('Main process log capture requested but the CDP bridge is unavailable.');
         }
       }
 
@@ -863,39 +859,43 @@ export default class ElectronWorkerService extends ServiceConfig implements Serv
   }
 }
 
+// A disabled fuse is not an error: the session runs without the bridge.
+type CdpBridgeResult = Result<ElectronCdpBridge | undefined, Error>;
+
+const NO_BRIDGE: CdpBridgeResult = { ok: true, value: undefined };
+
+const connectedBridge = (result: CdpBridgeResult) => (result.ok ? result.value : undefined);
+
+// WebdriverIO only logs a before() hook that throws and runs the spec anyway, so a
+// failed connection is returned for the API stub to report.
 async function initCdpBridge(
   cdpOptions: CdpBridgeOptions,
   capabilities: WebdriverIO.Capabilities,
-): Promise<ElectronCdpBridge | undefined> {
-  try {
-    // Check if the Electron binary has the necessary fuse enabled
-    const binaryPath = capabilities['goog:chromeOptions']?.binary;
-    if (binaryPath && typeof binaryPath === 'string') {
-      const fuseCheck = await checkInspectFuse(binaryPath);
+): Promise<CdpBridgeResult> {
+  // Check if the Electron binary has the necessary fuse enabled
+  const binaryPath = capabilities['goog:chromeOptions']?.binary;
+  if (binaryPath && typeof binaryPath === 'string') {
+    const fuseCheck = await checkInspectFuse(binaryPath);
 
-      // Fuse is disabled - cannot use CDP bridge
-      if (!fuseCheck.canUseCdpBridge) {
-        // Don't warn here - this will be handled by the API stub functions
-        return undefined;
-      }
-
-      // Fuse check encountered an error but we're proceeding anyway
-      if (fuseCheck.error) {
-        log.warn(fuseCheck.error);
-      }
+    // Fuse disabled: the API stub explains why.
+    if (!fuseCheck.canUseCdpBridge) {
+      return NO_BRIDGE;
     }
 
-    const options = Object.assign({}, cdpOptions, getDebuggerEndpoint(capabilities));
+    if (fuseCheck.error) {
+      log.warn(fuseCheck.error);
+    }
+  }
 
+  try {
+    const options = Object.assign({}, cdpOptions, getDebuggerEndpoint(capabilities));
     const cdpBridge = new ElectronCdpBridge(options);
     await cdpBridge.connect();
-    return cdpBridge;
+    return { ok: true, value: cdpBridge };
   } catch (error) {
-    log.warn(
-      'CDP bridge initialization failed — electron.execute(), mock(), and related APIs will be unavailable:',
-      error,
-    );
-    return undefined;
+    const cause = error instanceof Error ? error : new Error(String(error));
+    log.error(`CDP bridge could not connect to the main process, API is disabled: ${cause.message}`);
+    return { ok: false, error: cause };
   }
 }
 
@@ -917,10 +917,16 @@ const copyOriginalApi = async (browser: WebdriverIO.Browser) => {
   );
 };
 
-function getElectronAPI(this: ServiceConfig, browser: WebdriverIO.Browser, cdpBridge?: ElectronCdpBridge) {
+function getElectronAPI(this: ServiceConfig, browser: WebdriverIO.Browser, bridge: CdpBridgeResult) {
+  const cdpBridge = connectedBridge(bridge);
   const disabledApiFunc = () => {
+    if (!bridge.ok) {
+      throw new Error(`CDP bridge could not connect to the main process, API is disabled: ${bridge.error.message}`, {
+        cause: bridge.error,
+      });
+    }
     log.warn('CDP bridge is not available, API is disabled');
-    log.warn('This may be due to EnableNodeCliInspectArguments fuse being disabled or other connection issues.');
+    log.warn('The EnableNodeCliInspectArguments fuse is disabled, so the Node inspector cannot start.');
     log.warn('To enable the CDP bridge, ensure this fuse is enabled in your test builds.');
     log.warn('See: https://www.electronjs.org/docs/latest/tutorial/fuses#nodecliinspect');
     throw new Error('CDP bridge is not available, API is disabled');
