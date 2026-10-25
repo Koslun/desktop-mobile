@@ -368,7 +368,6 @@ export default class TauriLaunchService {
         log.info(`Starting ${capEntries.length} embedded WebDriver instance(s) for multiremote`);
 
         const hostname = '127.0.0.1';
-        const basePort = getEmbeddedPort(mergedOptions);
 
         for (let i = 0; i < capEntries.length; i++) {
           const [key, value] = capEntries[i];
@@ -377,8 +376,7 @@ export default class TauriLaunchService {
           const instanceOptions = mergeOptions(this.options, cap['wdio:tauriServiceOptions']);
           this.instanceOptions.set(instanceId, instanceOptions);
 
-          // Each instance gets a unique port (base + i)
-          const embeddedPort = basePort + i;
+          const embeddedPort = await this.allocateEmbeddedPort(cap, instanceOptions, i);
           const appBinaryPath = cap['tauri:options']?.application;
 
           if (!appBinaryPath) {
@@ -557,7 +555,7 @@ export default class TauriLaunchService {
       for (let i = 0; i < capsList.length; i++) {
         const cap = capsList[i];
         const instanceOptions = mergeOptions(this.options, cap['wdio:tauriServiceOptions']);
-        const embeddedPort = getEmbeddedPort(instanceOptions);
+        const embeddedPort = await this.allocateEmbeddedPort(cap, instanceOptions, i);
         const appBinaryPath = cap['tauri:options']?.application;
 
         if (!appBinaryPath) {
@@ -806,6 +804,11 @@ export default class TauriLaunchService {
     }
 
     log.debug(`Tauri worker session started: ${cid}`);
+  }
+
+  private allocateEmbeddedPort(cap: TauriCapabilities, options: TauriServiceOptions, index: number): Promise<number> {
+    const instancePort = cap['wdio:tauriServiceOptions']?.embeddedPort;
+    return this.portManager.allocatePort(instancePort ?? getEmbeddedPort(options) + index);
   }
 
   /**
