@@ -52,7 +52,7 @@
     "@wdio/bundler": "workspace:*",
     "@wdio/types": "catalog:default",
     "shx": "^0.4.0",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "vitest": "^5.0.5",
     "webdriverio": "catalog:default"
   },
