@@ -38,6 +38,23 @@ async function keysInputEvents() {
   return (await browser.execute('return window.__keysInputEvents || []')) as unknown as ValueEvent[];
 }
 
+async function fieldEvents() {
+  return (await browser.execute('return window.__fieldEvents || []')) as unknown as string[];
+}
+
+// A field that logs input, change and blur with its value, next to a button to move focus to.
+async function fillChangeScratch(initialValue = '') {
+  await fillScratch(
+    `scratch.innerHTML = '<input id="fresh-field" value="${initialValue}"><button id="fresh-other">other</button>';
+    window.__fieldEvents = [];
+    for (var type of ["input", "change", "blur"]) {
+      document.querySelector("#fresh-field").addEventListener(type, function (ev) {
+        window.__fieldEvents.push(ev.type + " " + ev.target.value);
+      });
+    }`,
+  );
+}
+
 async function fillScratch(script: string) {
   await browser.execute(`var scratch = document.querySelector("#keys-scratch"); ${script}`);
 }
@@ -51,8 +68,10 @@ async function errorOf(action: Promise<unknown>) {
 
 describe('special keys (embedded)', () => {
   beforeEach(async () => {
+    // Blurring first fires any change a field still owes, before the event logs reset.
     await browser.execute(
-      'window.__keyTargetEvents = [];' +
+      'if (document.activeElement) { document.activeElement.blur(); }' +
+        'window.__keyTargetEvents = [];' +
         'document.querySelector("#keys-input").value = "";' +
         'document.querySelector("#keys-editor").textContent = "";' +
         'document.querySelector("#keys-blocking-input").value = "";' +
@@ -279,12 +298,55 @@ describe('special keys (embedded)', () => {
     const input = browser.$('#keys-input');
     await input.addValue(Key.NULL);
     await input.addValue(Key.PageDown);
+    await browser.$('#key-target').click();
     expect(await keysInputEvents()).toEqual([]);
     await input.addValue('a');
+    expect(await keysInputEvents()).toEqual([{ type: 'input', value: 'a' }]);
+    await browser.$('#key-target').click();
     expect(await keysInputEvents()).toEqual([
       { type: 'input', value: 'a' },
       { type: 'change', value: 'a' },
     ]);
+  });
+
+  it('should fire change once focus leaves a field Send Keys edited, before blur', async () => {
+    await fillChangeScratch();
+    const field = browser.$('#fresh-field');
+    await field.addValue('ab');
+    await field.addValue('c');
+    expect(await fieldEvents()).toEqual(['input ab', 'input abc']);
+    await browser.$('#fresh-other').click();
+    expect(await fieldEvents()).toEqual(['input ab', 'input abc', 'change abc', 'blur abc']);
+  });
+
+  it('should fire change after blur when the page moves focus', async () => {
+    await fillChangeScratch();
+    await browser.$('#fresh-field').addValue('x');
+    await browser.execute('document.querySelector("#fresh-other").focus()');
+    expect(await fieldEvents()).toEqual(['input x', 'blur x', 'change x']);
+  });
+
+  it('should fire no change when the edits leave the value as it was', async () => {
+    await fillChangeScratch();
+    const field = browser.$('#fresh-field');
+    await field.addValue('x');
+    await field.addValue(Key.Backspace);
+    await browser.$('#fresh-other').click();
+    expect(await fieldEvents()).toEqual(['input x', 'input ', 'blur ']);
+  });
+
+  it('should clear with input, then change, then blur', async () => {
+    await fillChangeScratch('old');
+    await browser.$('#fresh-field').clearValue();
+    expect(await fieldEvents()).toEqual(['input ', 'change ', 'blur ']);
+  });
+
+  it('should leave the change for setValue until focus leaves', async () => {
+    await fillChangeScratch('1');
+    await browser.$('#fresh-field').setValue('2');
+    expect(await fieldEvents()).toEqual(['input ', 'change ', 'blur ', 'input 2']);
+    await browser.$('#fresh-other').click();
+    expect(await fieldEvents()).toEqual(['input ', 'change ', 'blur ', 'input 2', 'change 2', 'blur 2']);
   });
 
   it('should type line breaks and quotes from the actions API', async () => {

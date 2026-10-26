@@ -560,6 +560,50 @@ pub fn plain_text(steps: &[SendKeysStep]) -> Option<&str> {
   }
 }
 
+/// Where the page records the field Send Keys edited and its value from before the edit: a browser
+/// fires `change` when focus leaves an edited field, so the driver fires it then.
+pub const PENDING_CHANGE: &str = "window.__wdio_pending_change";
+
+/// JS firing the `change` a field still owes from Send Keys, unless `keeps_focus` (a JS expression
+/// over `pendingField`) holds. The driver runs it before it moves focus, so `change` precedes `blur`.
+pub fn commit_pending_change_js(keeps_focus: &str) -> String {
+  format!(
+    r"var pendingChange = {PENDING_CHANGE};
+                if (pendingChange) {{
+                    var pendingField = pendingChange.el;
+                    if (!({keeps_focus})) {{
+                        {PENDING_CHANGE} = null;
+                        if (pendingField.isConnected && pendingField.value !== pendingChange.value) {{
+                            pendingField.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                    }}
+                }}"
+  )
+}
+
+/// JS recording that `el` owes a `change` if its value differs from `initial_value` once focus
+/// leaves it. An earlier record for the same field wins, as it holds the value from before the first
+/// edit. A `blur` listener covers focus the page moves; there `change` follows `blur`.
+fn record_pending_change_js(el: &str, initial_value: &str) -> String {
+  let commit_other_field = commit_pending_change_js(&format!("pendingField === {el}"));
+  format!(
+    r"{commit_other_field}
+                if (!{PENDING_CHANGE}) {{
+                    var record = {{ el: {el}, value: {initial_value} }};
+                    {PENDING_CHANGE} = record;
+                    {el}.addEventListener('blur', function onBlur() {{
+                        record.el.removeEventListener('blur', onBlur);
+                        if ({PENDING_CHANGE} === record) {{
+                            {PENDING_CHANGE} = null;
+                            if (record.el.value !== record.value) {{
+                                record.el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            }}
+                        }}
+                    }});
+                }}"
+  )
+}
+
 /// JS starting send keys: sets a value control's value to `typed`, or focuses the element once and,
 /// for a `plain` request, types it too. Returns `{ status, value }` and never throws.
 pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&str>) -> String {
@@ -568,6 +612,9 @@ pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&st
   let receiver_text_field = is_text_field_js("receiver");
   let value_control = is_value_control_js("el");
   let typed = js_string(typed);
+  let commit_change = commit_pending_change_js(
+    "(function (node) { for (; node; node = node.parentNode || node.host) { if (node === el) { return true; } } return false; })(pendingField)",
+  );
   let finish = match plain {
     None => format!(
       r"window.{js_var}__receiver = receiver;
@@ -576,10 +623,11 @@ pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&st
     Some(text) => {
       let insert_text =
         if text.is_empty() { String::new() } else { insert_text_js("receiver", &js_string(text)) };
+      let record_change = record_pending_change_js("receiver", "initialValue");
       format!(
         r"{insert_text}
-                if (initialValue !== null && receiver.value !== initialValue) {{
-                    receiver.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                if (initialValue !== null) {{
+                    {record_change}
                 }}
                 return {{ status: 'done' }};"
       )
@@ -594,6 +642,7 @@ pub fn build_send_keys_start_script(js_var: &str, typed: &str, plain: Option<&st
                 if (el.tagName === 'INPUT' && el.type === 'file') {{
                     return {{ status: 'file' }};
                 }}
+                {commit_change}
                 var typed = {typed};
                 if ({value_control} && typed !== '') {{
                     if (el.readOnly || el.disabled) {{
@@ -675,16 +724,16 @@ pub fn build_insert_run_script(run: &str) -> String {
   )
 }
 
-/// JS firing one `change` if the field that received the text no longer holds `initial_value`; it
-/// skips a detached field so a retry can't duplicate keystrokes that already committed.
-pub fn build_send_keys_change_script(js_var: &str, initial_value: &str) -> String {
-  let initial_value = js_string(initial_value);
+/// JS recording that the field that received the keys owes a `change` once focus leaves it, if it no
+/// longer holds `initial_value`; it skips a detached field.
+pub fn build_send_keys_record_change_script(js_var: &str, initial_value: &str) -> String {
+  let record_change = record_pending_change_js("el", &js_string(initial_value));
   format!(
     r"(function() {{
                 var el = window.{js_var}__receiver;
                 delete window.{js_var}__receiver;
-                if (el && el.isConnected && el.value !== {initial_value}) {{
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                if (el && el.isConnected) {{
+                    {record_change}
                 }}
                 return true;
             }})()"
@@ -1218,8 +1267,8 @@ mod tests {
     )));
     assert!(script.contains("window.__wd_el_abc__receiver = receiver;"));
     let plain = build_send_keys_start_script("__wd_el_abc", "x", Some("x"));
-    assert!(plain.contains("receiver.value !== initialValue"));
-    assert!(plain.contains("receiver.dispatchEvent(new Event('change'"));
+    assert!(plain.contains("var record = { el: receiver, value: initialValue };"));
+    assert!(!plain.contains("receiver.dispatchEvent(new Event('change'"));
   }
 
   #[test]
@@ -1245,8 +1294,8 @@ mod tests {
     let plain = build_send_keys_start_script("__wd_el_abc", "hi", Some("hi"));
     let focus = plain.find("focusTarget.focus()").unwrap();
     let insert = plain.find("var insertedText = \"hi\"").unwrap();
-    let change = plain.rfind("new Event('change'").unwrap();
-    assert!(focus < insert && insert < change);
+    let record = plain.find("var record = { el: receiver").unwrap();
+    assert!(focus < insert && insert < record);
     assert!(plain.contains("return { status: 'done' };"));
     let empty = build_send_keys_start_script("__wd_el_abc", "", Some(""));
     assert!(!empty.contains("insertedText") && empty.contains("return { status: 'done' };"));
@@ -1263,12 +1312,47 @@ mod tests {
   }
 
   #[test]
-  fn build_send_keys_change_script_fires_change_only_for_a_changed_value() {
-    let script = build_send_keys_change_script("__wd_el_abc", "it's\n");
+  fn build_send_keys_record_change_script_defers_change_to_when_focus_leaves() {
+    let script = build_send_keys_record_change_script("__wd_el_abc", "it's\n");
     assert!(script.contains("var el = window.__wd_el_abc__receiver;"));
-    assert!(script.contains(&format!("el.value !== {}", js_string("it's\n"))));
-    assert!(script.contains("new Event('change'"));
+    assert!(script.contains(&format!("var record = {{ el: el, value: {} }};", js_string("it's\n"))));
+    assert!(script.contains("if (el && el.isConnected) {"));
+    // Only the commit of another field and the blur listener fire `change`, never the record itself.
+    assert_eq!(script.matches("new Event('change'").count(), 2, "{script}");
     assert!(!script.contains("throw"));
+  }
+
+  #[test]
+  fn commit_pending_change_fires_change_once_and_only_for_a_changed_value() {
+    let script = commit_pending_change_js("pendingField === el");
+    let keeps = script.find("if (!(pendingField === el)) {").unwrap();
+    let cleared = script.find(&format!("{PENDING_CHANGE} = null;")).unwrap();
+    let changed = script.find("pendingField.value !== pendingChange.value").unwrap();
+    let change = script.find("pendingField.dispatchEvent(new Event('change'").unwrap();
+    assert!(keeps < cleared && cleared < changed && changed < change);
+    assert!(script.contains("pendingField.isConnected"));
+  }
+
+  #[test]
+  fn record_pending_change_keeps_the_first_edit_and_commits_on_blur() {
+    let script = record_pending_change_js("receiver", "initialValue");
+    let other_field = script.find("if (!(pendingField === receiver)) {").unwrap();
+    let only_if_none = script.find(&format!("if (!{PENDING_CHANGE}) {{")).unwrap();
+    let blur = script.find("receiver.addEventListener('blur'").unwrap();
+    assert!(other_field < only_if_none && only_if_none < blur);
+    let listener = &script[blur..];
+    assert!(listener.contains(&format!("if ({PENDING_CHANGE} === record) {{")));
+    assert!(listener.contains("record.el.value !== record.value"));
+    assert!(listener.contains("record.el.removeEventListener('blur', onBlur);"));
+  }
+
+  #[test]
+  fn send_keys_start_commits_a_pending_change_before_moving_focus() {
+    let script = build_send_keys_start_script("__wd_el_abc", "x", Some("x"));
+    let commit = script.find(&format!("var pendingChange = {PENDING_CHANGE};")).unwrap();
+    assert!(commit < script.find("el.focus();").unwrap());
+    assert!(commit < script.find("focusTarget.focus();").unwrap());
+    assert!(script[commit..].contains("node = node.parentNode || node.host) { if (node === el)"));
   }
 
   #[test]
@@ -1317,8 +1401,8 @@ mod tests {
     assert!(script.contains(&format!("var typed = {};", js_string("2026-10-21"))));
     assert!(script.contains(&format!("if ({control} && typed !== '')")));
     assert!(script.contains("return { status: 'immutable' };"));
-    let input = script.find("new Event('input'").unwrap();
-    let change = script.find("new Event('change'").unwrap();
+    let input = script.find("el.dispatchEvent(new Event('input'").unwrap();
+    let change = script.find("el.dispatchEvent(new Event('change'").unwrap();
     assert!(script.contains("if (el.value !== previousValue)") && input < change);
   }
 

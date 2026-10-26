@@ -726,68 +726,14 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
 
   /// Click on element
   async fn click_element(&self, js_var: &str) -> Result<(), WebDriverErrorResponse> {
-    let active_element = crate::platform::key_input::deep_active_element_js("activeEl");
-    let text_field = crate::platform::key_input::is_text_field_js("el");
-    let script = format!(
-      r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
-                }}
-                {active_element}
-                // A caret set before focus stops WebKit selecting a fresh field's text (or putting a
-                // textarea's caret first), while a select-on-focus handler still picks its own selection.
-                if (activeEl !== el && {text_field}) {{
-                    try {{
-                        el.setSelectionRange(el.value.length, el.value.length);
-                    }} catch (e) {{}}
-                }}
-                el.scrollIntoView({{ block: 'center', inline: 'center' }});
-                el.click();
-                // Explicitly focus the element after click - programmatic click()
-                // doesn't always trigger focus like a real click would
-                if (typeof el.focus === 'function') {{
-                    el.focus();
-                }}
-                return true;
-            }})()"
-    );
+    let script = click_element_script(js_var);
     self.evaluate_js(&script).await?;
     Ok(())
   }
 
   /// Clear element content (for inputs/textareas)
   async fn clear_element(&self, js_var: &str) -> Result<(), WebDriverErrorResponse> {
-    let script = format!(
-      r"(function() {{
-                var el = window.{js_var};
-                if (!el || !el.isConnected) {{
-                    throw new Error('stale element reference');
-                }}
-                if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (el.disabled || el.readOnly)) {{
-                    return 'not editable';
-                }}
-                el.focus();
-                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
-                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
-                        'value'
-                    ).set;
-                    nativeInputValueSetter.call(el, '');
-                    var inputEvent = new InputEvent('input', {{
-                        bubbles: true,
-                        cancelable: true,
-                        inputType: 'deleteContentBackward'
-                    }});
-                    el.dispatchEvent(inputEvent);
-                    var changeEvent = new Event('change', {{ bubbles: true }});
-                    el.dispatchEvent(changeEvent);
-                }} else if (el.isContentEditable) {{
-                    el.innerHTML = '';
-                }}
-                return true;
-            }})()"
-    );
+    let script = clear_element_script(js_var);
     if extract_value(&self.evaluate_js(&script).await?)?.as_str() == Some("not editable") {
       return Err(WebDriverErrorResponse::invalid_element_state(
         "element is disabled or read-only, so it cannot be cleared",
@@ -847,8 +793,8 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
       }
     }
     if let Some(initial_value) = start.get("value").and_then(Value::as_str) {
-      let change_script = key_input::build_send_keys_change_script(js_var, initial_value);
-      self.evaluate_js(&change_script).await?;
+      let record_script = key_input::build_send_keys_record_change_script(js_var, initial_value);
+      self.evaluate_js(&record_script).await?;
     }
     Ok(())
   }
@@ -1699,6 +1645,115 @@ pub trait PlatformExecutor<R: Runtime>: Send + Sync {
 // =============================================================================
 
 /// Extract string value from JavaScript result
+/// JS clicking `el` and focusing it, firing first any `change` a field owes from Send Keys if the
+/// click moves focus away from it.
+fn click_element_script(js_var: &str) -> String {
+  let active_element = crate::platform::key_input::deep_active_element_js("activeEl");
+  let text_field = crate::platform::key_input::is_text_field_js("el");
+  let commit_change = crate::platform::key_input::commit_pending_change_js(
+    "pendingField === el || el.control === pendingField",
+  );
+  format!(
+    r"(function() {{
+              var el = window.{js_var};
+              if (!el || !el.isConnected) {{
+                  throw new Error('stale element reference');
+              }}
+              {active_element}
+              // A caret set before focus stops WebKit selecting a fresh field's text (or putting a
+              // textarea's caret first), while a select-on-focus handler still picks its own selection.
+              if (activeEl !== el && {text_field}) {{
+                  try {{
+                      el.setSelectionRange(el.value.length, el.value.length);
+                  }} catch (e) {{}}
+              }}
+              {commit_change}
+              el.scrollIntoView({{ block: 'center', inline: 'center' }});
+              el.click();
+              // Explicitly focus the element after click - programmatic click()
+              // doesn't always trigger focus like a real click would
+              if (typeof el.focus === 'function') {{
+                  el.focus();
+              }}
+              return true;
+          }})()"
+  )
+}
+
+/// JS for Element Clear with W3C's focusing and unfocusing steps: `el` takes focus, clears with an
+/// `input` event, then blurs, firing `change` first if its value differs from its last committed one.
+fn clear_element_script(js_var: &str) -> String {
+  let pending_change = crate::platform::key_input::PENDING_CHANGE;
+  let commit_change = crate::platform::key_input::commit_pending_change_js("pendingField === el");
+  format!(
+    r"(function() {{
+              var el = window.{js_var};
+              if (!el || !el.isConnected) {{
+                  throw new Error('stale element reference');
+              }}
+              if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (el.disabled || el.readOnly)) {{
+                  return 'not editable';
+              }}
+              {commit_change}
+              var committedValue = el.value;
+              if ({pending_change} && {pending_change}.el === el) {{
+                  committedValue = {pending_change}.value;
+                  {pending_change} = null;
+              }}
+              el.focus();
+              if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
+                  var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                      el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype,
+                      'value'
+                  ).set;
+                  nativeInputValueSetter.call(el, '');
+                  var inputEvent = new InputEvent('input', {{
+                      bubbles: true,
+                      cancelable: true,
+                      inputType: 'deleteContentBackward'
+                  }});
+                  el.dispatchEvent(inputEvent);
+                  if (el.value !== committedValue) {{
+                      el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                  }}
+              }} else if (el.isContentEditable) {{
+                  el.innerHTML = '';
+              }}
+              el.blur();
+              return true;
+          }})()"
+  )
+}
+
+#[cfg(test)]
+mod element_script_tests {
+  use super::*;
+  use crate::platform::key_input::PENDING_CHANGE;
+
+  #[test]
+  fn click_commits_a_pending_change_unless_it_clicks_that_field_or_its_label() {
+    let script = click_element_script("__wd_el_abc");
+    let commit = script.find(&format!("var pendingChange = {PENDING_CHANGE};")).unwrap();
+    assert!(commit < script.find("el.click();").unwrap());
+    assert!(commit < script.find("el.focus();").unwrap());
+    assert!(script.contains("if (!(pendingField === el || el.control === pendingField)) {"));
+  }
+
+  #[test]
+  fn clear_fires_input_then_change_against_the_committed_value_then_blurs() {
+    let script = clear_element_script("__wd_el_abc");
+    let commit = script.find("if (!(pendingField === el)) {").unwrap();
+    let committed = script.find(&format!("committedValue = {PENDING_CHANGE}.value;")).unwrap();
+    let focus = script.find("el.focus();").unwrap();
+    let input = script.find("el.dispatchEvent(inputEvent);").unwrap();
+    let change = script.find("if (el.value !== committedValue) {").unwrap();
+    let blur = script.find("el.blur();").unwrap();
+    assert!(commit < committed && committed < focus && focus < input);
+    assert!(input < change && change < blur);
+    assert_eq!(script.matches("new Event('change'").count(), 2, "{script}");
+  }
+}
+
 fn extract_string_value(result: &Value) -> Result<String, WebDriverErrorResponse> {
   if let Some(success) = result.get("success").and_then(Value::as_bool) {
     if success {
