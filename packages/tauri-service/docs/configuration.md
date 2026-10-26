@@ -130,6 +130,10 @@ tauriDriverPath: 'C:\\tools\\tauri-driver.exe'; // Windows
 
 Log level for tauri-driver output.
 
+`tauri-driver` accepts only its port options and exits if it is given anything else, so this does not pass a log flag. Instead, the service prints the lines it recognises as driver output, down to this level. Lines without a level count as `info`.
+
+Embedded mode does not run `tauri-driver`, so `logLevel` has no effect there. App logs in that mode use `backendLogLevel`.
+
 **Example:**
 ```typescript
 logLevel: 'debug'; // More verbose

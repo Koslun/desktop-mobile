@@ -33,4 +33,16 @@ describe('mergeServiceOptions', () => {
       frontendLogLevel: 'info',
     });
   });
+
+  it('should default logLevel when neither side sets it', () => {
+    expect(mergeServiceOptions({}, {}).logLevel).toBe('info');
+  });
+
+  it('should keep a global logLevel when the capability leaves it unset', () => {
+    expect(mergeServiceOptions({ logLevel: 'debug' }, { logLevel: undefined }).logLevel).toBe('debug');
+  });
+
+  it('should let the capability override a global logLevel', () => {
+    expect(mergeServiceOptions({ logLevel: 'debug' }, { logLevel: 'error' }).logLevel).toBe('error');
+  });
 });
