@@ -94,14 +94,11 @@ Mask volatile regions (timestamps, avatars) using the visual service's `hideElem
 
 ### Linux: Xvfb display server (Tauri + Dioxus)
 
-Tauri and Dioxus tests on Linux need a display server. Both stacks use wry → WebKitGTK, which hits GTK pixbuf errors at 24-bit colour, so use a 16-bit Xvfb at 1280×1024. On WebdriverIO v10, set it in the config, and WebdriverIO starts it before the service starts your app:
+Tauri and Dioxus tests on Linux need a display server. On WebdriverIO v10, WebdriverIO starts one before the service starts your app. It prefers Weston when that's installed, so set `displayServer: 'xvfb'` if your app has X11-only dependencies:
 
 ```typescript
 export const config = {
   displayServer: 'xvfb',
-  displayServerWidth: 1280,
-  displayServerHeight: 1024,
-  displayServerDepth: 16,
   // ...
 };
 ```
@@ -109,11 +106,10 @@ export const config = {
 On WebdriverIO v9, wrap the run instead:
 
 ```bash
-xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x16" \
-  pnpm wdio run wdio.visual.conf.ts
+xvfb-run -a pnpm wdio run wdio.visual.conf.ts
 ```
 
-Electron needs no setup: WebdriverIO starts the display itself.
+Screenshots depend on the display's size and colour depth, so capture baselines and compare them under the same display settings. Electron needs no setup: WebdriverIO starts the display itself.
 
 ## Tauri provider notes
 

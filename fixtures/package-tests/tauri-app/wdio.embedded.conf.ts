@@ -63,11 +63,8 @@ export const config = {
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
-  // A 16-bit Xvfb: WebKitGTK hits GTK pixbuf errors at 24-bit colour.
+  // The app's clipboard crate needs X11.
   displayServer: 'xvfb',
-  displayServerWidth: 1280,
-  displayServerHeight: 1024,
-  displayServerDepth: 16,
   outputDir: path.join(__dirname, 'logs'),
   services: [
     [

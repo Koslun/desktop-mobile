@@ -155,10 +155,7 @@ export const config = {
   connectionRetryTimeout: process.platform === 'linux' ? 45_000 : 120_000,
   connectionRetryCount: 3,
   // Headless Weston never brings the WebKitGTK app up (packages/electrobun-service/src/display.ts).
-  // 1280×1024 at the default 24-bit depth.
   displayServer: 'xvfb',
-  displayServerWidth: 1280,
-  displayServerHeight: 1024,
   services: ['electrobun'],
   framework: 'mocha',
   reporters: ['spec'],
