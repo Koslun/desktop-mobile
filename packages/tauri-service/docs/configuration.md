@@ -657,19 +657,16 @@ services: [
 
 ### Headless Configuration (Linux)
 
-Run tests without a display server:
+To run without a display on WebdriverIO v10, install Xvfb and set `displayServer: 'xvfb'` at the root of the config:
 
 ```typescript
-services: [
-  [
-    '@wdio/tauri-service',
-    {
-      appBinaryPath: './src-tauri/target/release/my-app',
-      // Xvfb is auto-detected if available (WebdriverIO 9.19.1+)
-    },
-  ],
-];
+export const config = {
+  displayServer: 'xvfb',
+  services: [['@wdio/tauri-service', { appBinaryPath: './src-tauri/target/release/my-app' }]],
+};
 ```
+
+On WebdriverIO v9, wrap the run in `xvfb-run` instead. See [Headless Testing](./platform-support.md#headless-testing).
 
 ## Finding Your appBinaryPath
 

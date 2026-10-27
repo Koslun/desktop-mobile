@@ -5,7 +5,7 @@ import type { Options } from '@wdio/types';
 // these runs ask for Xvfb rather than Weston.
 export const webkitDisplayServer = { displayServer: 'xvfb' } as const;
 
-/** Standalone specs bypass the testrunner, which is what starts the display, so they start their own. */
+// Standalone specs bypass the testrunner, which is what starts the display, so they start their own.
 export function startWebKitDisplay() {
   return startDisplayDaemonFromConfig(webkitDisplayServer as Options.Testrunner);
 }

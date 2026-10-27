@@ -198,11 +198,11 @@ To run tests without a display (CI/CD environments):
 Install Xvfb:
 
 ```bash
-sudo apt-get install -y xvfb  # Debian/Ubuntu
-sudo dnf install -y xvfb      # Fedora
+sudo apt-get install -y xvfb              # Debian/Ubuntu
+sudo dnf install -y xorg-x11-server-Xvfb  # Fedora
 ```
 
-With WebdriverIO v10 you don't need a wrapper: WebdriverIO starts a display server before the service starts your app. It prefers Weston when that's installed, so set `displayServer: 'xvfb'` if your app has X11-only dependencies, such as the `clipboard` crate:
+With WebdriverIO v10 you don't need a wrapper: WebdriverIO starts a display server before the service starts your app. It tries Weston first, and the service is only tested on Xvfb, so set `displayServer: 'xvfb'`:
 
 ```typescript
 export const config = {

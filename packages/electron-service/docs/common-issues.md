@@ -72,15 +72,13 @@ See: [Electron Fuses Documentation](https://www.electronjs.org/docs/latest/tutor
 
 ## DevToolsActivePort file doesn't exist
 
-This is a Chromium error which may appear when using Docker or CI. Most of the "fixes" discussed online are based around passing different combinations of args to Chromium - you can set these via [`appArgs`](./configuration.md#appargs), though in most cases using xvfb has proven to be more effective; WebdriverIO starts a display for the E2E run on Linux CI.
+This is a Chromium error which may appear when using Docker or CI. Most of the "fixes" discussed online are based around passing different combinations of args to Chromium - you can set these via [`appArgs`](./configuration.md#appargs), though in most cases running under a virtual display such as Xvfb has proven more effective.
 
-On WebdriverIO v10 a display server starts on Linux with no configuration. See [Headless & Display Servers](https://webdriver.io/docs/headless-and-display-servers). On v9.19.1+, `autoXvfb` covers the test workers and is on by default; setting that key on v10 logs a deprecation warning. Older WebdriverIO needs `xvfb-run` or `xvfb-maybe`.
+WebdriverIO 9.19.1+ starts a virtual display on Linux when none is set; older versions need `xvfb-run` or `xvfb-maybe`. See [Headless & Display Servers](https://webdriver.io/docs/headless-and-display-servers).
 
 ### Failed to create session. session not created: probably user data directory is already in use, please specify a unique value for --user-data-dir argument, or don't use --user-data-dir
 
-This is another obscure Chromium error which, despite the message, is usually not fixed by providing a unique `--user-data-dir` value. In the Electron context this usually occurs when the Electron app crashes during or shortly after initialization. WDIO / ChromeDriver attempts to reconnect, starting a new electron instance, which attempts to use the same user-data-dir path. Whilst there may be other causes, on Linux this is often fixed with xvfb.
-
-On WebdriverIO v10 a display server starts on Linux with no configuration. See [Headless & Display Servers](https://webdriver.io/docs/headless-and-display-servers). On v9.19.1+, `autoXvfb` covers the test workers and is on by default; setting that key on v10 logs a deprecation warning. Older WebdriverIO needs `xvfb-run` or `xvfb-maybe`.
+This is another obscure Chromium error which, despite the message, is usually not fixed by providing a unique `--user-data-dir` value. In the Electron context this usually occurs when the Electron app crashes during or shortly after initialization. WDIO / ChromeDriver attempts to reconnect, starting a new electron instance, which attempts to use the same user-data-dir path. Whilst there may be other causes, on Linux this is often fixed with a virtual display, as described [above](#devtoolsactiveport-file-doesnt-exist).
 
 ### All versions of Electron fail to open on Ubuntu 24.04+
 

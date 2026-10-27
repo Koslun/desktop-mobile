@@ -154,7 +154,7 @@ export const config = {
   // re-spawns a fresh app instead of burning ~120s per attempt.
   connectionRetryTimeout: process.platform === 'linux' ? 45_000 : 120_000,
   connectionRetryCount: 3,
-  // Headless Weston never brings the WebKitGTK app up (packages/electrobun-service/src/display.ts).
+  // Headless Weston never brings the WebKitGTK app up.
   displayServer: 'xvfb',
   services: ['electrobun'],
   framework: 'mocha',

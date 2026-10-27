@@ -94,7 +94,7 @@ Mask volatile regions (timestamps, avatars) using the visual service's `hideElem
 
 ### Linux: Xvfb display server (Tauri + Dioxus)
 
-Tauri and Dioxus tests on Linux need a display server. On WebdriverIO v10, WebdriverIO starts one before the service starts your app. It prefers Weston when that's installed, so set `displayServer: 'xvfb'` if your app has X11-only dependencies:
+Tauri and Dioxus tests on Linux need a display server. On WebdriverIO v10, WebdriverIO starts one before the service starts your app. It tries Weston first, and both services are only tested on Xvfb, so set `displayServer: 'xvfb'`:
 
 ```typescript
 export const config = {
