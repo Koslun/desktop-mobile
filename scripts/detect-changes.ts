@@ -20,6 +20,8 @@
  *   - packages/<unrecognised>/**                 → unknown (runs all — convention drift, fail loud)
  *   - e2e/test/<svc>[-...]/**, e2e/wdio.<svc>*.conf.ts → that service; other e2e/** → all (shared test infra)
  *   - fixtures/{e2e-apps,package-tests}/<svc>[-...]/** → that service; unrecognised dir → unknown
+ *   - a .github/workflows/ YAML file whose diff only adds or removes comments and blank lines → none
+ *     (main reads the diff from DIFF_BASE; if it can't, the file falls through to the rules below)
  *   - .github/workflows/: core-infra list → all; meta list → none;
  *     actions/** → all; service token in filename → that service; else → unknown
  *   - scripts/: service token in filename → that service; else → all (cross-service tooling)
@@ -52,6 +54,7 @@ interface Classification {
   lintOnly: boolean;
   triggersAll: string[];
   unknownFiles: string[];
+  commentOnlyFiles: string[];
   sharedDetail: Array<{ file: string; pkg: string; services: string[]; typesOnly: boolean }>;
   perFile: Array<{ file: string; verdict: Verdict }>;
 }
@@ -166,6 +169,73 @@ export function buildServiceDependents(repoRoot: string, services: string[]): Re
     dependents[dir].sort();
   }
   return dependents;
+}
+
+const WORKFLOW_YAML = /^\.github\/workflows\/.+\.ya?ml$/;
+
+// A diff with no changed lines (a rename or mode change) doesn't count. A `#` line inside a block
+// scalar, such as a heredoc or a github-script, looks like a comment here too.
+export function isCommentOnlyYamlDiff(diff: string): boolean {
+  let inHunk = false;
+  let changed = 0;
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git')) {
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk || !(line.startsWith('+') || line.startsWith('-'))) {
+      continue;
+    }
+    changed++;
+    if (!/^\s*(#.*)?$/.test(line.slice(1))) {
+      return false;
+    }
+  }
+  return changed > 0;
+}
+
+// A file whose diff can't be read (readDiff returns undefined) keeps its usual verdict.
+export function findCommentOnlyWorkflowChanges(
+  files: string[],
+  services: string[],
+  readDiff: (file: string) => string | undefined,
+): Set<string> {
+  const commentOnly = new Set<string>();
+  for (const file of files) {
+    if (!WORKFLOW_YAML.test(file) || classifyFile(file, services) === 'none') {
+      continue;
+    }
+    const diff = readDiff(file);
+    if (diff !== undefined && isCommentOnlyYamlDiff(diff)) {
+      commentOnly.add(file);
+    }
+  }
+  return commentOnly;
+}
+
+function gitDiffReader(diffBase: string | undefined): (file: string) => string | undefined {
+  let base: string | undefined;
+  try {
+    base = diffBase ? execFileSync('git', ['merge-base', diffBase, 'HEAD'], { encoding: 'utf8' }).trim() : undefined;
+  } catch {
+    base = undefined;
+  }
+  return (file) => {
+    if (!base) {
+      return undefined;
+    }
+    try {
+      return execFileSync('git', ['diff', '--unified=0', '--no-color', '--no-ext-diff', base, 'HEAD', '--', file], {
+        encoding: 'utf8',
+      });
+    } catch {
+      return undefined;
+    }
+  };
 }
 
 function serviceForDir(dir: string, services: string[]): string | undefined {
@@ -418,13 +488,21 @@ function lockfileVerdict(effect: LockfileEffect): Verdict {
   return [...effect.services].sort().join(',');
 }
 
+function diffBaseRef(): string | undefined {
+  const baseRef = process.env.DIFF_BASE ?? '';
+  // Reject anything that isn't a plain ref, and a new branch's all-zero before-sha.
+  if (!/^[A-Za-z0-9._/-]+$/.test(baseRef) || baseRef.startsWith('-') || /^0+$/.test(baseRef)) {
+    return undefined;
+  }
+  return baseRef;
+}
+
 function readLockfilePair(files: string[]): { base: string; head: string } | undefined {
   if (!files.includes('pnpm-lock.yaml')) {
     return undefined;
   }
-  const baseRef = process.env.LOCKFILE_BASE ?? '';
-  // Reject anything that isn't a plain ref, and a new branch's all-zero before-sha.
-  if (!/^[A-Za-z0-9._/-]+$/.test(baseRef) || baseRef.startsWith('-') || /^0+$/.test(baseRef)) {
+  const baseRef = diffBaseRef();
+  if (!baseRef) {
     return undefined;
   }
   try {
@@ -541,11 +619,13 @@ export function classifyChanges(
     releaseCommit = false,
     dependents = {} as Record<string, string[]>,
     lockfile,
+    commentOnly = new Set<string>(),
   }: {
     forceAll?: boolean;
     releaseCommit?: boolean;
     dependents?: Record<string, string[]>;
     lockfile?: { base: string; head: string };
+    commentOnly?: Set<string>;
   } = {},
 ): Classification {
   const runs: Record<string, boolean> = Object.fromEntries(services.map((svc) => [svc, false]));
@@ -561,15 +641,39 @@ export function classifyChanges(
     for (const svc of services) {
       runs[svc] = true;
     }
-    return { runs, sharedChanges: true, lintOnly: false, triggersAll, unknownFiles, sharedDetail, perFile: [] };
+    return {
+      runs,
+      sharedChanges: true,
+      lintOnly: false,
+      triggersAll,
+      unknownFiles,
+      commentOnlyFiles: [],
+      sharedDetail,
+      perFile: [],
+    };
   }
 
   if (releaseCommit) {
-    return { runs, sharedChanges: false, lintOnly: true, triggersAll, unknownFiles, sharedDetail, perFile: [] };
+    return {
+      runs,
+      sharedChanges: false,
+      lintOnly: true,
+      triggersAll,
+      unknownFiles,
+      commentOnlyFiles: [],
+      sharedDetail,
+      perFile: [],
+    };
   }
 
   const perFile: Array<{ file: string; verdict: Verdict }> = [];
+  const commentOnlyFiles: string[] = [];
   for (const file of files) {
+    if (commentOnly.has(file)) {
+      commentOnlyFiles.push(file);
+      perFile.push({ file, verdict: 'none' });
+      continue;
+    }
     if (file === 'pnpm-lock.yaml') {
       if (!lockfile) {
         perFile.push({ file, verdict: 'all' });
@@ -644,7 +748,7 @@ export function classifyChanges(
   // A types-only shared change runs no service yet must still build/typecheck, so the
   // sharedChanges term keeps it off this path (build + unit gate on `run_lint_only != true`).
   const lintOnly = services.every((svc) => !runs[svc]) && !sharedChanges;
-  return { runs, sharedChanges, lintOnly, triggersAll, unknownFiles, sharedDetail, perFile };
+  return { runs, sharedChanges, lintOnly, triggersAll, unknownFiles, commentOnlyFiles, sharedDetail, perFile };
 }
 
 function appendFile(envVar: string, content: string): void {
@@ -661,12 +765,10 @@ function main(): void {
   const services = discoverServices(process.cwd());
   const dependents = buildServiceDependents(process.cwd(), services);
   const lockfile = readLockfilePair(files);
+  const commentOnly = findCommentOnlyWorkflowChanges(files, services, gitDiffReader(diffBaseRef()));
 
-  const { runs, sharedChanges, lintOnly, triggersAll, unknownFiles, sharedDetail, perFile } = classifyChanges(
-    files,
-    services,
-    { forceAll, releaseCommit, dependents, lockfile },
-  );
+  const { runs, sharedChanges, lintOnly, triggersAll, unknownFiles, commentOnlyFiles, sharedDetail, perFile } =
+    classifyChanges(files, services, { forceAll, releaseCommit, dependents, lockfile, commentOnly });
 
   let output = '';
   for (const [svc, run] of Object.entries(runs)) {
@@ -696,6 +798,12 @@ function main(): void {
   if (triggersAll.length > 0) {
     summary += '\n### Core infra / cross-service changes (run all pipelines)\n\n';
     for (const file of triggersAll) {
+      summary += `- \`${file}\`\n`;
+    }
+  }
+  if (commentOnlyFiles.length > 0) {
+    summary += '\n### Comment-only workflow changes (no pipelines)\n\n';
+    for (const file of commentOnlyFiles) {
       summary += `- \`${file}\`\n`;
     }
   }
