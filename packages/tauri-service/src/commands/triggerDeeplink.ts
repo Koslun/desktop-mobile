@@ -10,8 +10,6 @@ export { executeDeeplinkCommand, getPlatformCommand, validateDeeplinkUrl };
 
 const log = createLogger('tauri-service', 'triggerDeeplink');
 
-// The event tauri-plugin-deep-link emits for an opened URL; its `onOpenUrl` (JS) and
-// `on_open_url` (Rust) listen for it.
 const DEEP_LINK_EVENT = 'deep-link://new-url';
 
 interface TauriInternals {

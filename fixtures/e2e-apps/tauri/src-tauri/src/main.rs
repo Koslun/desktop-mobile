@@ -328,8 +328,7 @@ fn main() {
     builder = builder.plugin(tauri_plugin_automation::init());
   }
 
-  // Single-instance only for deeplink runs (see enable_single_instance). Its `deep-link` feature
-  // hands a second instance's URL to the deep-link plugin, so the callback has nothing to do.
+  // The single-instance plugin's `deep-link` feature forwards the URL, so the callback is empty.
   if enable_single_instance {
     builder = builder.plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}));
   }
@@ -348,8 +347,7 @@ fn main() {
         emit_deep_links(&app.handle());
       }
 
-      // Deep links opened while the app runs, from the OS or from browser.tauri.triggerDeeplink.
-      // They go straight to the page: DEEP_LINKS holds only the launch links get_deep_links replays.
+      // Runtime links go straight to the page; DEEP_LINKS keeps only the launch links.
       let handle = app.handle().clone();
       app.deep_link().on_open_url(move |event| {
         for url in event.urls() {

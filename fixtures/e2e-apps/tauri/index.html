@@ -256,8 +256,7 @@
         });
       }
 
-      // Deep link listener for E2E testing: the backend re-emits each URL tauri-plugin-deep-link
-      // delivers as deeplink-received, and get_deep_links returns the ones the app was launched with
+      // The backend re-emits deep links as deeplink-received; get_deep_links returns launch links.
       window.receivedDeeplinks = [];
       window.deeplinkCount = 0;
       window.frontendDeeplinks = [];
@@ -268,7 +267,6 @@
         const { listen } = await import('@tauri-apps/api/event');
         const { onOpenUrl } = await import('@tauri-apps/plugin-deep-link');
 
-        // The plugin's frontend handler, which the deeplink guide tells apps to use
         await onOpenUrl((urls) => {
           window.frontendDeeplinks.push(...urls);
         });
