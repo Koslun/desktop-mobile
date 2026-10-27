@@ -55,6 +55,7 @@ catalogs:
     "@wdio/mocha-framework": 10.1.0
     "@wdio/spec-reporter": 10.1.0
     "@wdio/types": 10.1.0
+    "@wdio/utils": 10.1.0
     "@wdio/visual-service": 11.0.0
     electron: 45.0.0
     electron-builder: 26.18.0
@@ -68,6 +69,7 @@ catalogs:
     "@wdio/mocha-framework": ^9.0.0
     "@wdio/spec-reporter": ^9.0.0
     "@wdio/types": ^9.0.0
+    "@wdio/utils": ^9.0.0
     "@wdio/visual-service": ^10.0.0
     electron: 28.3.3
     webdriverio: ^9.0.0
@@ -81,6 +83,7 @@ catalogs:
     "@wdio/mocha-framework": latest
     "@wdio/spec-reporter": latest
     "@wdio/types": latest
+    "@wdio/utils": latest
     "@wdio/visual-service": latest
     electron-builder: next
     electron-nightly: 47.0.0-nightly.20261023

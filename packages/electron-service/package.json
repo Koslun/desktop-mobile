@@ -97,6 +97,7 @@
     "@wdio/globals": "catalog:default",
     "@wdio/native-spy": "workspace:*",
     "@wdio/types": "catalog:default",
+    "@wdio/utils": "catalog:default",
     "builder-util": "^26.16.0",
     "devtools-protocol": "^0.0.1724436",
     "electron": "catalog:default",

@@ -140,7 +140,7 @@ export const config = {
   - ⚠️ Main process log capture will be disabled with a warning
   - ⚠️ Warning visible with `DEBUG=wdio-electron-service:*`
   - ✅ Tests continue normally - no failures
-  - See [Common Issues - CDP bridge initialization](./common-issues.md#cdp-bridge-cannot-be-initialized-enablenodecliinspectarguments-fuse-is-disabled) for troubleshooting
+  - See [EnableNodeCliInspectArguments fuse is disabled](./common-issues.md#cdp-bridge-cannot-be-initialized-enablenodecliinspectarguments-fuse-is-disabled) or [CDP bridge could not connect](./common-issues.md#cdp-bridge-could-not-connect-to-the-main-process) for troubleshooting
 
 **Renderer Process Logs:**
 - Use Puppeteer CDP sessions - work independently of main process CDP bridge

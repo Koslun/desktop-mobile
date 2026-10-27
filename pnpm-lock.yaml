@@ -191,6 +191,9 @@ catalogs:
     '@wdio/types':
       specifier: 10.1.0
       version: 10.1.0
+    '@wdio/utils':
+      specifier: 10.1.0
+      version: 10.1.0
     '@wdio/visual-service':
       specifier: 11.0.0
       version: 11.0.0
@@ -1272,6 +1275,9 @@ importers:
       '@wdio/types':
         specifier: catalog:default
         version: 10.1.0
+      '@wdio/utils':
+        specifier: catalog:default
+        version: 10.1.0(supports-color@8.1.1)(yauzl@3.4.0)
       builder-util:
         specifier: ^26.16.0
         version: 26.16.0(supports-color@8.1.1)

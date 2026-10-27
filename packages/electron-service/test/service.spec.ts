@@ -204,16 +204,26 @@ describe('Electron Worker Service', () => {
       expect(() => serviceApi.restoreAllMocks()).toThrow('CDP bridge is not available, API is disabled');
     });
 
-    it('should gracefully degrade when CDP bridge connection fails', async () => {
+    it('should disable the API with the connection error when the CDP bridge cannot connect', async () => {
       const { ElectronCdpBridge } = await import('../src/bridge.js');
-      vi.mocked(ElectronCdpBridge.prototype.connect).mockRejectedValueOnce(new Error('Connection refused'));
+      const connectionError = new Error('Connection refused');
+      vi.mocked(ElectronCdpBridge.prototype.connect).mockRejectedValueOnce(connectionError);
 
       instance = new ElectronWorkerService({}, {});
       await instance.before({}, [], browser);
 
       const serviceApi = browser.electron as BrowserExtension['electron'];
-      expect(() => serviceApi.execute(() => {})).toThrow('CDP bridge is not available, API is disabled');
-      expect(() => serviceApi.mock('app', 'getName')).toThrow('CDP bridge is not available, API is disabled');
+      let thrown: unknown;
+      try {
+        serviceApi.execute(() => {});
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({
+        message: 'CDP bridge could not connect to the main process, API is disabled: Connection refused',
+        cause: connectionError,
+      });
+      expect(() => serviceApi.mock('app', 'getName')).toThrow('CDP bridge could not connect to the main process');
     });
 
     it('should log warning when fuse check has non-fatal error', async () => {
