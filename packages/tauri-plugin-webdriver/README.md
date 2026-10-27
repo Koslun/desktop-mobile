@@ -34,16 +34,16 @@ Android and iOS are not supported. The plugin still builds for them, so an app t
 
 ## Installation
 
-> **Warning**: This plugin exposes automation capabilities via HTTP. Never include it in production builds.
+> **Warning**: This plugin exposes automation capabilities via HTTP. Never register it in production builds.
 
-Add to your `Cargo.toml` as a dev/test-only dependency:
+Add it to your `Cargo.toml`:
 
 ```toml
-[target.'cfg(debug_assertions)'.dependencies]
+[dependencies]
 tauri-plugin-wdio-webdriver = "1"
 ```
 
-Or use a feature flag for more control:
+The registration below only runs in debug builds, so release builds never start the server. To leave the crate out of release builds entirely, use a feature flag, and gate the registration on `#[cfg(feature = "webdriver")]` instead:
 
 ```toml
 [features]
@@ -81,7 +81,7 @@ export const config = {
     [
       '@wdio/tauri-service',
       {
-        driverProvider: 'embedded', // Auto-detected on macOS
+        driverProvider: 'embedded', // The default, so this line is optional
       },
     ],
   ],
@@ -90,7 +90,7 @@ export const config = {
     {
       browserName: 'tauri',
       'tauri:options': {
-        application: './src-tauri/target/release/my-app',
+        application: './src-tauri/target/debug/my-app',
       },
     },
   ],
@@ -305,7 +305,7 @@ before a requested size is applied, including moves between displays.
 ## See Also
 
 - [Plugin Setup Guide](../tauri-service/docs/plugin-setup.md) — Full setup instructions including this plugin
-- [Platform Support](../tauri-service/docs/platform-support.md) — Per-platform details
+- [Choosing a Driver Provider](../tauri-service/docs/configuration.md#choosing-a-driver-provider) — When to use the embedded provider
 - [Upstream repository](https://github.com/Choochmeque/tauri-plugin-webdriver) — Original project
 
 ## License
