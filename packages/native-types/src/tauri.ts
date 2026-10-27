@@ -374,6 +374,8 @@ export interface TauriServiceGlobalOptions extends BaseServiceGlobalOptions, Dri
    * @default 'main'
    */
   windowLabel?: string;
+  /** Timeout for app startup in ms. A capability-level value takes precedence. */
+  startTimeout?: number;
 }
 
 /**

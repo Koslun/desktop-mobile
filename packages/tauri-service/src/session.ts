@@ -5,7 +5,7 @@ import { boundedOnComplete, createLogger, errorMessage, failStartup, safeDeleteS
 import { remote } from 'webdriverio';
 import TauriLaunchService from './launcher.js';
 import TauriWorkerService from './service.js';
-import { mergeServiceOptions } from './serviceConfig.js';
+import { mergeServiceOptions, resolveStartTimeout } from './serviceConfig.js';
 import type { TauriCapabilities, TauriServiceGlobalOptions } from './types.js';
 
 const log = createLogger('tauri-service', 'service');
@@ -95,9 +95,9 @@ export async function init(
   log.debug('Initializing Tauri service in standalone mode...');
 
   const capabilities = copyCapabilities(callerCapabilities);
-  const serviceOptions = capabilities['wdio:tauriServiceOptions'] ?? {};
+  const serviceOptions = mergeServiceOptions(globalOptions ?? {}, capabilities['wdio:tauriServiceOptions']);
   if (serviceOptions.captureBackendLogs || serviceOptions.captureFrontendLogs) {
-    if (mergeServiceOptions(globalOptions, serviceOptions).mode === 'browser') {
+    if (serviceOptions.mode === 'browser') {
       log.warn('Log capture is unavailable in browser mode: there is no Tauri app process to capture logs from');
     } else if (serviceOptions.logDir) {
       const writer = getLogWriter('tauri-service');
@@ -124,7 +124,7 @@ export async function init(
     // Browser mode has no Tauri driver: WebdriverIO starts and manages chromedriver itself.
     const remoteOptions = launcher.isBrowserMode
       ? { capabilities: browserSessionCapabilities(capabilities) }
-      : await driverRemoteOptions(capabilities, serviceOptions.startTimeout || 30000);
+      : await driverRemoteOptions(capabilities, resolveStartTimeout(serviceOptions));
 
     const service = new TauriWorkerService(globalOptions ?? {}, capabilities);
 
@@ -198,8 +198,8 @@ export function createTauriCapabilities(
       appBinaryPath,
       appArgs: options.appArgs || [],
       tauriDriverPort: options.tauriDriverPort,
-      logLevel: options.logLevel || 'info',
-      startTimeout: options.startTimeout || 60000,
+      logLevel: options.logLevel,
+      startTimeout: options.startTimeout,
       driverProvider: options.driverProvider,
       autoInstallTauriDriver: options.autoInstallTauriDriver,
     },

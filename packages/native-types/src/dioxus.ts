@@ -157,6 +157,8 @@ export interface DioxusServiceGlobalOptions extends BaseServiceGlobalOptions, Dr
   windowLabel?: string;
   captureBackendLogs?: boolean;
   captureFrontendLogs?: boolean;
+  /** Timeout for app startup in ms. A capability-level value takes precedence. */
+  startTimeout?: number;
 }
 
 /**
