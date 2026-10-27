@@ -1,10 +1,12 @@
 import * as fs from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildServiceDependents,
   classifyChanges,
   classifyFile,
   discoverServices,
+  findCommentOnlyWorkflowChanges,
+  isCommentOnlyYamlDiff,
 } from '../../scripts/detect-changes.ts';
 
 const SERVICES = ['dioxus', 'electrobun', 'electron', 'flutter', 'react-native', 'tauri'];
@@ -529,5 +531,81 @@ describe('pnpm-lock.yaml', () => {
     expect(d.runs.flutter).toBe(false);
     expect(d.triggersAll).toEqual([]);
     expect(d.unknownFiles).toEqual([]);
+  });
+});
+
+function diffOf(...lines: string[]): string {
+  return ['diff --git a/x.yml b/x.yml', '--- a/x.yml', '+++ b/x.yml', '@@ -1 +1 @@', ...lines].join('\n');
+}
+
+describe('isCommentOnlyYamlDiff', () => {
+  it('should accept a diff that only changes comments', () => {
+    expect(isCommentOnlyYamlDiff(diffOf('-      # Dioxus: target', '+      # Dioxus: target/dx'))).toBe(true);
+  });
+
+  it('should accept added comments and blank lines', () => {
+    expect(isCommentOnlyYamlDiff(diffOf('+', '+# Why this job exists', '+   '))).toBe(true);
+  });
+
+  it('should reject a diff that also changes a value', () => {
+    expect(isCommentOnlyYamlDiff(diffOf('-  # note', '+  # note', '-    run: a', '+    run: b'))).toBe(false);
+  });
+
+  it('should reject a comment added after a value', () => {
+    expect(isCommentOnlyYamlDiff(diffOf('-    run: build', '+    run: build # fast'))).toBe(false);
+  });
+
+  it('should not count file headers as changed lines', () => {
+    expect(isCommentOnlyYamlDiff('diff --git a/x.yml b/x.yml\n--- a/x.yml\n+++ b/x.yml')).toBe(false);
+  });
+
+  it('should reject an empty diff', () => {
+    expect(isCommentOnlyYamlDiff('')).toBe(false);
+  });
+});
+
+describe('findCommentOnlyWorkflowChanges', () => {
+  const diffs: Record<string, string | undefined> = {
+    '.github/workflows/_ci-package.reusable.yml': diffOf('-      # old', '+      # new'),
+    '.github/workflows/_ci-build.reusable.yml': diffOf('-    run: a', '+    run: b'),
+    '.github/workflows/codeql.yml': diffOf('-  # old', '+  # new'),
+    '.github/workflows/_ci-unit.reusable.yml': undefined,
+  };
+  const files = [...Object.keys(diffs), 'scripts/test-package.ts'];
+
+  it('should find the workflow files whose diff only touches comments', () => {
+    const found = findCommentOnlyWorkflowChanges(files, SERVICES, (file) => diffs[file]);
+    expect([...found]).toEqual(['.github/workflows/_ci-package.reusable.yml']);
+  });
+
+  it('should only read diffs of workflow files that would run pipelines', () => {
+    const readDiff = vi.fn((file: string) => diffs[file]);
+    findCommentOnlyWorkflowChanges(files, SERVICES, readDiff);
+    expect(readDiff.mock.calls.map(([file]) => file)).toEqual([
+      '.github/workflows/_ci-package.reusable.yml',
+      '.github/workflows/_ci-build.reusable.yml',
+      '.github/workflows/_ci-unit.reusable.yml',
+    ]);
+  });
+});
+
+describe('classifyChanges with comment-only workflow changes', () => {
+  it('should run only dioxus when the core workflow change is comment-only', () => {
+    const d = classifyChanges(
+      ['.github/workflows/_ci-package.reusable.yml', 'fixtures/package-tests/dioxus-app/wdio.conf.ts'],
+      SERVICES,
+      { dependents: DEPENDENTS, commentOnly: new Set(['.github/workflows/_ci-package.reusable.yml']) },
+    );
+    expect(d.runs).toEqual(Object.fromEntries(SERVICES.map((svc) => [svc, svc === 'dioxus'])));
+    expect(d.triggersAll).toEqual([]);
+    expect(d.commentOnlyFiles).toEqual(['.github/workflows/_ci-package.reusable.yml']);
+  });
+
+  it('should run lint-only for a comment-only workflow change on its own', () => {
+    const d = classifyChanges(['.github/workflows/ci.yml'], SERVICES, {
+      dependents: DEPENDENTS,
+      commentOnly: new Set(['.github/workflows/ci.yml']),
+    });
+    expect(d.lintOnly).toBe(true);
   });
 });
