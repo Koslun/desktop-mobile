@@ -123,7 +123,7 @@ describe('Tauri API', () => {
       expect(events).toEqual([{ message: 'hello from emitEvent' }]);
     });
 
-    it('should emit an event to a target window label when target is provided', async () => {
+    it('should emit only to the target window when a target is provided', async () => {
       await browser.tauri.execute(async ({ core }) => {
         const g = globalThis as unknown as {
           __wdioTargetedEvents?: unknown[];
@@ -133,21 +133,24 @@ describe('Tauri API', () => {
         const handler = g.__TAURI_INTERNALS__.transformCallback((ev) => {
           g.__wdioTargetedEvents?.push(ev.payload);
         });
+        // Listen as the main window, so an event sent to another label doesn't arrive.
         await core.invoke('plugin:event|listen', {
           event: 'wdio:test-emit-to',
-          target: { kind: 'Any' },
+          target: { kind: 'WebviewWindow', label: 'main' },
           handler,
         });
       });
 
-      await browser.tauri.emitEvent('wdio:test-emit-to', { count: 42 }, 'main');
+      // Events arrive in order, so if the first one leaked, it would arrive before the second.
+      await browser.tauri.emitEvent('wdio:test-emit-to', { to: 'other' }, 'no-such-window');
+      await browser.tauri.emitEvent('wdio:test-emit-to', { to: 'main' }, 'main');
 
       await browser.waitUntil(
         async () => {
           const events = await browser.tauri.execute(() => {
             return (globalThis as unknown as { __wdioTargetedEvents?: unknown[] }).__wdioTargetedEvents ?? [];
           });
-          return events.length === 1;
+          return events.length > 0;
         },
         { timeout: 5000, timeoutMsg: 'expected wdio:test-emit-to listener on main to receive event' },
       );
@@ -155,7 +158,7 @@ describe('Tauri API', () => {
       const events = await browser.tauri.execute(() => {
         return (globalThis as unknown as { __wdioTargetedEvents?: unknown[] }).__wdioTargetedEvents;
       });
-      expect(events).toEqual([{ count: 42 }]);
+      expect(events).toEqual([{ to: 'main' }]);
     });
   });
 });
