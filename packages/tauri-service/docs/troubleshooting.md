@@ -326,20 +326,7 @@ export const config = {
 };
 ```
 
-**Solution 2: Increase Start Timeout**
-
-```typescript
-services: [
-  [
-    '@wdio/tauri-service',
-    {
-      startTimeout: 60000, // Allow more time for app to start
-    },
-  ],
-];
-```
-
-**Solution 3: Wait for App to Be Ready**
+**Solution 2: Wait for App to Be Ready**
 
 ```typescript
 it('should wait for app', async () => {
@@ -352,7 +339,7 @@ it('should wait for app', async () => {
 });
 ```
 
-**Solution 4: Check App Logs**
+**Solution 3: Check App Logs**
 
 Enable logging to see what's happening:
 
@@ -363,7 +350,8 @@ services: [
     {
       captureBackendLogs: true,
       captureFrontendLogs: true,
-      logLevel: 'debug',
+      backendLogLevel: 'debug',
+      frontendLogLevel: 'debug',
     },
   ],
 ];
@@ -514,24 +502,22 @@ export const config = {
 
 ### Enable Debug Logging
 
-Get more detailed information about what the service is doing:
+Get more detailed information about what the service is doing by setting WebdriverIO's `logLevel`:
 
 ```typescript
-services: [
-  [
-    '@wdio/tauri-service',
-    {
-      logLevel: 'debug', // Verbose logging
-    },
-  ],
-];
+export const config = {
+  logLevel: 'debug',
+  // ...
+};
 ```
 
-### Verbose Test Output
+Or pass it on the command line:
 
 ```bash
 npx wdio run wdio.conf.ts --logLevel debug
 ```
+
+The service's own `logLevel` option only filters `tauri-driver` output.
 
 ### Check Service Status
 
