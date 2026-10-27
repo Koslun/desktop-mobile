@@ -88,9 +88,8 @@ export const config = {
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
-  // Don't use autoXvfb - tauri-driver runs in launcher (not worker) and needs display
-  // The entire test command must be wrapped with xvfb-run in CI
-  autoXvfb: false,
+  // The app's clipboard crate needs X11.
+  displayServer: 'xvfb',
   // Output directory for logs
   outputDir: path.join(__dirname, 'logs'),
   services: [

@@ -63,7 +63,8 @@ export const config = {
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
-  autoXvfb: false,
+  // The app's clipboard crate needs X11.
+  displayServer: 'xvfb',
   outputDir: path.join(__dirname, 'logs'),
   services: [
     [

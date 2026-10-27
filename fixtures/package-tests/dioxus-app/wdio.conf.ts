@@ -59,7 +59,8 @@ export const config = {
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
-  autoXvfb: false,
+  // Dioxus is tested on X11, not Weston.
+  displayServer: 'xvfb',
   outputDir: path.join(__dirname, 'logs'),
   services: [
     [

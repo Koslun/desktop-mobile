@@ -198,22 +198,23 @@ To run tests without a display (CI/CD environments):
 Install Xvfb:
 
 ```bash
-sudo apt-get install -y xvfb  # Debian/Ubuntu
-sudo dnf install -y xvfb      # Fedora
+sudo apt-get install -y xvfb              # Debian/Ubuntu
+sudo dnf install -y xorg-x11-server-Xvfb  # Fedora
 ```
 
-Run tests:
+With WebdriverIO v10 you don't need a wrapper: WebdriverIO starts a display server before the service starts your app. It tries Weston first, and the service is only tested on Xvfb, so set `displayServer: 'xvfb'`:
+
+```typescript
+export const config = {
+  displayServer: 'xvfb',
+  // ...
+};
+```
+
+With WebdriverIO v9, its virtual display only covers the test workers, not the service that starts your app, so wrap the whole run:
 
 ```bash
 xvfb-run -a npm run test:e2e
-```
-
-Or automatically via WebdriverIO (requires wdio 9.19.1+):
-
-```typescript
-services: [['@wdio/tauri-service', {
-  // Xvfb is auto-detected and used if available
-}]],
 ```
 
 **With Wayland**
