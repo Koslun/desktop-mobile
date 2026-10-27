@@ -1,0 +1,63 @@
+name: Baseline workspace typecheck
+
+on:
+  push:
+    branches: [chore/baseline-typecheck-ci]
+
+permissions:
+  contents: read
+
+env:
+  TURBO_TELEMETRY_DISABLED: "1"
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
+jobs:
+  typecheck:
+    name: Untouched upstream baseline on Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact upstream baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        timeout-minutes: 2
+        with:
+          ref: 96080300f975cc6e2e86ab962f94bbc548ffc9a1
+          persist-credentials: false
+
+      - name: Verify untouched source revision
+        timeout-minutes: 1
+        run: |
+          test "$(git rev-parse HEAD)" = "96080300f975cc6e2e86ab962f94bbc548ffc9a1"
+          test -z "$(git status --porcelain)"
+          git show --no-patch --format=fuller HEAD
+
+      - name: Set up pnpm from baseline packageManager
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        timeout-minutes: 3
+        with:
+          run_install: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        timeout-minutes: 3
+        with:
+          node-version: "24"
+
+      - name: Record runner and toolchain
+        timeout-minutes: 1
+        run: |
+          uname -a
+          node --version
+          pnpm --version
+
+      - name: Install baseline frozen dependencies
+        timeout-minutes: 10
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages and E2E support
+        timeout-minutes: 10
+        run: pnpm build --force
+
+      - name: Typecheck entire workspace without cached results
+        timeout-minutes: 10
+        run: pnpm turbo run typecheck --continue=always --force
